@@ -1,275 +1,221 @@
 // backend/src/services/paperTrader.js
-// Step C: learning + controlled paper trading (SAFE defaults)
+// Paper trading engine + visible learning stats (confidence, ticks, decision reason)
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
-
-// How fast it starts trading (warmup)
-const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200); // lower = trades sooner
-
-// Risk / sizing
+const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 200); // collect data before first trade
 const RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.01); // 1% of balance per trade
-const MAX_POSITION_USD = Number(process.env.PAPER_MAX_POSITION_USD || 2000); // cap exposure
+const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004); // 0.4%
+const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003); // 0.3%
+const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007); // trend threshold (0.07%)
 
-// Strategy thresholds (edge)
-const MIN_TREND_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0008); // ~0.08%
-const TAKE_PROFIT_PCT = Number(process.env.PAPER_TAKE_PROFIT_PCT || 0.003); // 0.30%
-const STOP_LOSS_PCT = Number(process.env.PAPER_STOP_LOSS_PCT || 0.002); // 0.20%
-
-// Safety: throttle trading
-const MIN_SECONDS_BETWEEN_TRADES = Number(process.env.PAPER_MIN_SECONDS_BETWEEN_TRADES || 25);
-
-// Optional: pause paper trading on Sabbath window (simple switch)
-const SABBATH_PAUSE = String(process.env.SABBATH_PAUSE || "false").toLowerCase() === "true";
-
-// --- state ---
 let state = {
   running: false,
   balance: START_BAL,
   pnl: 0,
-
-  // learning stats
+  trades: [],
+  position: null, // {symbol, side:'LONG', qty, entry, time}
+  lastPriceBySymbol: {},
   learnStats: {
     ticksSeen: 0,
-    confidence: 0,        // 0..1
-    volatility: 0,        // 0..1 (scaled)
-    lastReason: "starting",
-    lastDecision: "HOLD",
-    lastUpdated: null,
+    confidence: 0,         // 0..1
+    volatility: 0,         // normalized
+    trendEdge: 0,          // relative slope-ish
+    decision: "WAIT",      // WAIT | BUY | SELL
+    lastReason: "not_started",
+    lastTickTs: null
   },
-
-  // price tracking
-  lastPrice: null,
-  lastTs: null,
-
-  // EMA trend
-  emaFast: null,
-  emaSlow: null,
-
-  // volatility tracking
-  prevPrice: null,
-  volEma: 0,
-
-  // position / trades
-  position: null, // { side:'LONG', entry, qty, entryTs, tp, sl }
-  trades: [],
-
-  // safety timing
-  lastTradeTs: 0,
+  // rolling price buffer per symbol
+  buf: {
+    BTCUSDT: [],
+    ETHUSDT: []
+  }
 };
 
-// --- helpers ---
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-
-function nowMs(tsMaybe) {
-  const t = Number(tsMaybe);
-  return Number.isFinite(t) ? t : Date.now();
+function resetMoney() {
+  state.balance = Number(process.env.PAPER_START_BALANCE || START_BAL);
+  state.pnl = 0;
+  state.trades = [];
+  state.position = null;
 }
 
-function isSabbath(ms) {
-  // Simple placeholder: if you enable SABBATH_PAUSE, we pause trading always
-  // (we can upgrade to true Friday-sundown logic by location later)
-  return SABBATH_PAUSE;
-}
-
-function ema(prev, value, alpha) {
-  if (prev == null) return value;
-  return prev + alpha * (value - prev);
-}
-
-function pushTrade(t) {
-  state.trades.push(t);
-  if (state.trades.length > 200) state.trades.shift();
-}
-
-function updateLearn(reason, decision) {
-  state.learnStats.lastReason = reason;
-  state.learnStats.lastDecision = decision;
-  state.learnStats.lastUpdated = new Date().toISOString();
-}
-
-// --- public ---
 function start() {
   state.running = true;
-  state.balance = Number(process.env.PAPER_START_BALANCE || state.balance || START_BAL);
-  updateLearn("paper trader started", "HOLD");
+  resetMoney();
+  state.learnStats.ticksSeen = 0;
+  state.learnStats.confidence = 0;
+  state.learnStats.volatility = 0;
+  state.learnStats.trendEdge = 0;
+  state.learnStats.decision = "WAIT";
+  state.learnStats.lastReason = "started";
+  state.learnStats.lastTickTs = null;
 }
 
-function tick(symbol, price, ts) {
-  const p = Number(price);
-  if (!Number.isFinite(p) || p <= 0) return;
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
 
-  const ms = nowMs(ts);
-  state.lastPrice = p;
-  state.lastTs = ms;
+function mean(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((s, x) => s + x, 0) / arr.length;
+}
 
-  // --- learning counters ---
-  state.learnStats.ticksSeen += 1;
+function std(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  const v = mean(arr.map(x => (x - m) ** 2));
+  return Math.sqrt(v);
+}
 
-  // EMA trend (fast/slow)
-  // Fast reacts quicker, slow smoother
-  state.emaFast = ema(state.emaFast, p, 0.18);
-  state.emaSlow = ema(state.emaSlow, p, 0.06);
+function pushBuf(symbol, price) {
+  if (!state.buf[symbol]) state.buf[symbol] = [];
+  const b = state.buf[symbol];
+  b.push(price);
+  while (b.length > 60) b.shift(); // last 60 ticks
+}
 
-  // Volatility estimate (EMA of absolute returns)
-  if (state.prevPrice != null) {
-    const ret = Math.abs((p - state.prevPrice) / state.prevPrice);
-    state.volEma = ema(state.volEma, ret, 0.12);
-  }
-  state.prevPrice = p;
-
-  // Convert to a nice 0..1-ish number (scaled)
-  const volScaled = clamp(state.volEma * 120, 0, 1);
-  state.learnStats.volatility = volScaled;
-
-  // Confidence builds over time, but drops if volatility is extreme
-  const warm = clamp(state.learnStats.ticksSeen / Math.max(1, WARMUP_TICKS), 0, 1);
-  const volPenalty = clamp(volScaled * 0.55, 0, 0.55);
-  state.learnStats.confidence = clamp(0.15 + warm * 0.85 - volPenalty, 0, 1);
-
-  // --- Decision engine (paper trades) ---
-  if (!state.running) {
-    updateLearn("not running", "HOLD");
-    return;
+function computeSignals(symbol) {
+  const b = state.buf[symbol] || [];
+  if (b.length < 10) {
+    return { vol: 0, edge: 0, conf: 0, reason: "collecting_more_data" };
   }
 
-  if (isSabbath(ms)) {
-    updateLearn("paused (Sabbath pause enabled)", "HOLD");
+  const returns = [];
+  for (let i = 1; i < b.length; i++) {
+    const r = (b[i] - b[i - 1]) / b[i - 1];
+    returns.push(r);
+  }
+
+  const vol = std(returns); // raw volatility
+  const volNorm = clamp(vol / 0.002, 0, 1); // normalize (tuned for crypto)
+
+  // simple trend edge: compare last vs early average
+  const early = mean(b.slice(0, Math.floor(b.length / 3)));
+  const late = mean(b.slice(Math.floor((2 * b.length) / 3)));
+  const edge = (late - early) / (early || 1); // relative change
+
+  // confidence: needs enough ticks + some trend + not too noisy
+  const ticksFactor = clamp(state.learnStats.ticksSeen / WARMUP_TICKS, 0, 1);
+  const trendFactor = clamp(Math.abs(edge) / (MIN_EDGE * 2), 0, 1);
+  const noisePenalty = 1 - volNorm * 0.7;
+
+  const conf = clamp(ticksFactor * 0.55 + trendFactor * 0.55, 0, 1) * clamp(noisePenalty, 0.2, 1);
+
+  let reason = "waiting_warmup";
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) reason = "learning_warmup";
+  else if (Math.abs(edge) < MIN_EDGE) reason = "trend_unclear";
+  else if (volNorm > 0.85) reason = "too_noisy";
+  else reason = "edge_detected";
+
+  return { vol: volNorm, edge, conf, reason };
+}
+
+function maybeEnter(symbol, price, ts) {
+  const { vol, edge, conf, reason } = computeSignals(symbol);
+
+  state.learnStats.volatility = vol;
+  state.learnStats.trendEdge = edge;
+  state.learnStats.confidence = conf;
+  state.learnStats.lastReason = reason;
+
+  if (state.position) {
+    state.learnStats.decision = "WAIT";
     return;
   }
 
   if (state.learnStats.ticksSeen < WARMUP_TICKS) {
-    updateLearn(`warming up (${state.learnStats.ticksSeen}/${WARMUP_TICKS})`, "HOLD");
+    state.learnStats.decision = "WAIT";
     return;
   }
 
-  // throttle trade frequency
-  if (ms - state.lastTradeTs < MIN_SECONDS_BETWEEN_TRADES * 1000) {
-    updateLearn("cooldown active (prevent spam trades)", "HOLD");
+  if (conf < 0.45) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "confidence_low";
     return;
   }
 
-  // Need EMAs initialized
-  if (state.emaFast == null || state.emaSlow == null) {
-    updateLearn("ema not ready", "HOLD");
+  if (Math.abs(edge) < MIN_EDGE) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "trend_below_threshold";
     return;
   }
 
-  const edge = (state.emaFast - state.emaSlow) / state.emaSlow; // trend edge
-  const edgeAbs = Math.abs(edge);
+  // Enter LONG only (safe simple baseline)
+  const riskDollars = state.balance * RISK_PCT;
+  const qty = Math.max(0.00001, riskDollars / price);
 
-  // If volatility is too crazy, just watch
-  if (state.learnStats.volatility > 0.92) {
-    updateLearn("volatility too high — waiting", "HOLD");
-    return;
-  }
+  state.position = { symbol, side: "LONG", qty, entry: price, time: ts };
+  state.trades.push({ time: ts, symbol, type: "BUY", price, qty, note: "paper_entry" });
 
-  // If no clear trend edge, wait
-  if (edgeAbs < MIN_TREND_EDGE) {
-    updateLearn(`flat/no edge (${(edgeAbs * 100).toFixed(3)}%)`, "HOLD");
-    return;
-  }
+  state.learnStats.decision = "BUY";
+  state.learnStats.lastReason = "entered_long";
+}
 
-  // --- manage existing position ---
-  if (state.position) {
-    const pos = state.position;
-    const pnlUsd = (p - pos.entry) * pos.qty;
-    const pnlPct = (p - pos.entry) / pos.entry;
+function maybeExit(price, ts) {
+  const pos = state.position;
+  if (!pos) return;
 
-    // exits
-    if (pnlPct >= TAKE_PROFIT_PCT) {
-      // take profit
-      state.balance += pnlUsd;
-      state.pnl += pnlUsd;
-      pushTrade({
-        time: ms,
-        symbol: symbol || "BTCUSDT",
-        type: "SELL (TP)",
-        price: p,
-        qty: pos.qty,
-        profit: pnlUsd,
-        note: `take profit ${Math.round(TAKE_PROFIT_PCT * 10000) / 100}%`,
-      });
-      state.position = null;
-      state.lastTradeTs = ms;
-      updateLearn("took profit", "SELL");
-      return;
-    }
+  const entry = pos.entry;
+  const change = (price - entry) / entry;
 
-    if (pnlPct <= -STOP_LOSS_PCT) {
-      // stop loss
-      state.balance += pnlUsd;
-      state.pnl += pnlUsd;
-      pushTrade({
-        time: ms,
-        symbol: symbol || "BTCUSDT",
-        type: "SELL (SL)",
-        price: p,
-        qty: pos.qty,
-        profit: pnlUsd,
-        note: `stop loss ${Math.round(STOP_LOSS_PCT * 10000) / 100}%`,
-      });
-      state.position = null;
-      state.lastTradeTs = ms;
-      updateLearn("stopped out", "SELL");
-      return;
-    }
+  const tp = TAKE_PROFIT_PCT;
+  const sl = STOP_LOSS_PCT;
 
-    // If trend flips hard against position, exit early
-    if (edge < -MIN_TREND_EDGE * 1.2) {
-      state.balance += pnlUsd;
-      state.pnl += pnlUsd;
-      pushTrade({
-        time: ms,
-        symbol: symbol || "BTCUSDT",
-        type: "SELL (TrendFlip)",
-        price: p,
-        qty: pos.qty,
-        profit: pnlUsd,
-        note: "trend flipped against position",
-      });
-      state.position = null;
-      state.lastTradeTs = ms;
-      updateLearn("exited on trend flip", "SELL");
-      return;
-    }
+  if (change >= tp || change <= -sl) {
+    const profit = (price - entry) * pos.qty;
+    state.balance += profit;
+    state.pnl += profit;
 
-    updateLearn("holding position (monitoring TP/SL)", "HOLD");
-    return;
-  }
-
-  // --- open a new position (LONG only for now, safe & simple) ---
-  if (edge > MIN_TREND_EDGE) {
-    const usdToUse = Math.min(state.balance * RISK_PCT, MAX_POSITION_USD);
-    if (usdToUse < 10) {
-      updateLearn("balance too low to open position", "HOLD");
-      return;
-    }
-
-    const qty = usdToUse / p;
-
-    state.position = {
-      side: "LONG",
-      entry: p,
-      qty,
-      entryTs: ms,
-    };
-
-    pushTrade({
-      time: ms,
-      symbol: symbol || "BTCUSDT",
-      type: "BUY",
-      price: p,
-      qty,
-      profit: 0,
-      note: `edge ${(edge * 100).toFixed(3)}% • conf ${(state.learnStats.confidence * 100).toFixed(0)}%`,
+    state.trades.push({
+      time: ts,
+      symbol: pos.symbol,
+      type: "SELL",
+      price,
+      qty: pos.qty,
+      profit,
+      note: change >= tp ? "take_profit" : "stop_loss"
     });
 
-    state.lastTradeTs = ms;
-    updateLearn(`entered LONG (edge ${(edge * 100).toFixed(3)}%)`, "BUY");
-    return;
+    state.position = null;
+    state.learnStats.decision = "SELL";
+    state.learnStats.lastReason = change >= tp ? "tp_hit" : "sl_hit";
+  } else {
+    state.learnStats.decision = "WAIT";
+  }
+}
+
+// ✅ main tick entry
+// supports BOTH signatures:
+// tick(price)                 (legacy)
+// tick(symbol, price, ts)     (new)
+function tick(a, b, c) {
+  if (!state.running) return;
+
+  let symbol, price, ts;
+
+  if (typeof b === "undefined") {
+    // legacy: tick(price)
+    symbol = "BTCUSDT";
+    price = Number(a);
+    ts = Date.now();
+  } else {
+    symbol = String(a || "BTCUSDT");
+    price = Number(b);
+    ts = Number(c || Date.now());
   }
 
-  updateLearn("no entry rule matched", "HOLD");
+  if (!Number.isFinite(price)) return;
+
+  state.lastPriceBySymbol[symbol] = price;
+  state.learnStats.ticksSeen += 1;
+  state.learnStats.lastTickTs = ts;
+
+  pushBuf(symbol, price);
+
+  // update exit first (manage open risk)
+  maybeExit(price, ts);
+
+  // then decide entry
+  maybeEnter(symbol, price, ts);
 }
 
 function snapshot() {
@@ -277,17 +223,11 @@ function snapshot() {
     running: state.running,
     balance: state.balance,
     pnl: state.pnl,
-    trades: state.trades,
+    trades: state.trades.slice(-200),
     position: state.position,
-    lastPrice: state.lastPrice,
-    learnStats: {
-      ticksSeen: state.learnStats.ticksSeen,
-      confidence: state.learnStats.confidence,
-      volatility: state.learnStats.volatility,
-      lastReason: state.learnStats.lastReason,
-      lastDecision: state.learnStats.lastDecision,
-      lastUpdated: state.learnStats.lastUpdated,
-    },
+    lastPrice: state.lastPriceBySymbol.BTCUSDT ?? null,
+    lastPriceBySymbol: state.lastPriceBySymbol,
+    learnStats: state.learnStats
   };
 }
 

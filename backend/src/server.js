@@ -13,7 +13,7 @@ const users = require('./users/user.service');
 // ✅ Kraken live feed
 const { startKrakenFeed } = require('./services/krakenFeed');
 
-// ✅ Step B: Paper trader brain
+// ✅ Paper trader
 const paperTrader = require('./services/paperTrader');
 
 function requireEnv(name){
@@ -69,7 +69,7 @@ app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
 
-// ✅ Step B: paper status endpoint (proof endpoint)
+// ✅ Paper status endpoint (frontend reads this)
 app.get('/api/paper/status', (req, res) => {
   res.json(paperTrader.snapshot());
 });
@@ -78,7 +78,7 @@ app.get('/api/paper/status', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
-// Keep last known prices (used for hello snapshot)
+// Keep last known prices
 let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
@@ -94,21 +94,21 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'hello', symbols: Object.keys(last), last, ts: Date.now() }));
 });
 
-// ✅ Step B: start paper trader (learning)
+// ✅ Start paper trader
 paperTrader.start();
 
-// ✅ Kraken feed -> broadcast + feed paper trader brain
+// ✅ Start Kraken feed and broadcast ticks + feed paper trader
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
     // tick: {type:'tick', symbol:'BTCUSDT', price, ts}
     last[tick.symbol] = tick.price;
 
-    // broadcast live tick to frontend chart
+    // send to frontend
     broadcast(tick);
 
-    // feed the learning brain
-    paperTrader.onTick(tick.symbol, tick.price, tick.ts);
+    // ✅ feed into paper trader learning + decisions
+    paperTrader.tick(tick.symbol, tick.price, tick.ts);
   }
 });
 

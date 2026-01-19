@@ -55,34 +55,11 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// --- Feature flags (Stage C is locked OFF by default) ---
-const LIVE_TRADING_ENABLED = String(process.env.LIVE_TRADING_ENABLED || '').toLowerCase() === 'true';
-
 app.get('/health', (req, res) =>
   res.json({ ok: true, name: 'autoshield-tech-backend', time: new Date().toISOString() })
 );
 
-// ✅ Quick “are we connected to Kraken?” endpoint
-let market = {
-  source: 'kraken',
-  status: 'booting', // booting | connecting | connected | error | closed
-  lastTickTs: 0,
-  lastError: null,
-};
-
-app.get('/api/market/status', (req, res) => {
-  res.json({
-    ok: true,
-    market,
-    liveTrading: {
-      enabled: LIVE_TRADING_ENABLED,
-      note: LIVE_TRADING_ENABLED
-        ? 'Live trading is enabled (still needs broker wiring).'
-        : 'Live trading is locked OFF. Paper only.'
-    }
-  });
-});
-
+// ✅ routes
 app.use('/api/auth', authLimiter, require('./routes/auth.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/manager', require('./routes/manager.routes'));
@@ -91,16 +68,19 @@ app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
 
-// ✅ Paper status endpoint (frontend reads this)
+// ✅ NEW: Live (Kraken private) endpoints (keys/status/balances/dry-run orders)
+app.use('/api/live', require('./routes/live.routes'));
+
+// ✅ Paper status endpoint
 app.get('/api/paper/status', (req, res) => {
   res.json(paperTrader.snapshot());
 });
 
-// --- WebSocket server (frontend connects here) ---
+// --- WebSocket server ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
-// Last known prices (used for hello snapshot)
+// Last known prices
 let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
@@ -113,60 +93,21 @@ function broadcast(obj) {
 }
 
 wss.on('connection', (ws) => {
-  // Send available symbols + current snapshot
   ws.send(JSON.stringify({ type: 'hello', symbols: Object.keys(last), last, ts: Date.now() }));
-
-  // basic heartbeat (keeps connections stable on some hosts)
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
 });
 
-// heartbeat interval
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      try { ws.terminate(); } catch {}
-      return;
-    }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  });
-}, 30000);
-
-// ✅ Start paper trader (paper always runs)
+// ✅ Start paper trader
 paperTrader.start();
 
-// ✅ Start Kraken feed and broadcast ticks + feed paper
-const feed = startKrakenFeed({
-  onStatus: (s) => {
-    market.status = s;
-    if (s === 'error') market.lastError = market.lastError || 'kraken_error';
-    console.log('[kraken]', s);
-  },
+// ✅ Start Kraken feed (public) -> broadcast + paper trader ticks
+startKrakenFeed({
+  onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
-    // tick: { type:'tick', symbol:'BTCUSDT'|'ETHUSDT', price, ts }
     last[tick.symbol] = tick.price;
-    market.lastTickTs = tick.ts || Date.now();
-
-    // feed paper trader with symbol-based ticks
     paperTrader.tick(tick.symbol, tick.price, tick.ts);
-
-    // broadcast to frontend
     broadcast(tick);
-
-    // Stage C placeholder: live trading stays LOCKED OFF
-    // (later we will route signals -> broker ONLY if LIVE_TRADING_ENABLED === true)
   }
 });
-
-// graceful shutdown
-function shutdown() {
-  try { clearInterval(heartbeat); } catch {}
-  try { feed && feed.stop && feed.stop(); } catch {}
-  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
 
 const port = process.env.PORT || 5000;
 server.listen(port, () => console.log('AutoShield Tech backend on', port));

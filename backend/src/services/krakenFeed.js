@@ -1,57 +1,87 @@
-// src/services/krakenFeed.js
+// backend/src/services/krakenFeed.js
 const WebSocket = require('ws');
 
 /**
  * Connects to Kraken public WS and streams last prices.
- * Emits ticks as: { symbol: "BTCUSDT" | "ETHUSDT", price: Number, ts: Number }
- *
- * No API key required (public market data).
+ * Emits ticks: { type:'tick', symbol:'BTCUSDT'|'ETHUSDT', price:Number, ts:Number }
+ * No API keys required (public market data).
  */
 function startKrakenFeed({ onTick, onStatus }) {
   const URL = 'wss://ws.kraken.com';
-  let ws = null;
-  let closedByUs = false;
-  let reconnectTimer = null;
 
   const PAIRS = ['XBT/USD', 'ETH/USD'];
-  const MAP = {
-    'XBT/USD': 'BTCUSDT',
-    'ETH/USD': 'ETHUSDT',
-  };
+  const MAP = { 'XBT/USD': 'BTCUSDT', 'ETH/USD': 'ETHUSDT' };
 
-  function logStatus(s) {
+  let ws = null;
+  let closedByUs = false;
+
+  let reconnectTimer = null;
+  let backoffMs = 1500;
+
+  let lastMsgAt = 0;
+  let watchdog = null;
+
+  function safeStatus(s) {
     try { onStatus && onStatus(s); } catch {}
   }
 
+  function cleanup() {
+    try { if (watchdog) clearInterval(watchdog); } catch {}
+    watchdog = null;
+    try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch {}
+    reconnectTimer = null;
+    try { if (ws) ws.removeAllListeners(); } catch {}
+    ws = null;
+  }
+
+  function scheduleReconnect() {
+    if (closedByUs) return;
+    safeStatus('reconnecting');
+    const wait = backoffMs;
+    backoffMs = Math.min(backoffMs * 1.4, 15000); // cap 15s
+    reconnectTimer = setTimeout(connect, wait);
+  }
+
   function connect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    logStatus('connecting');
+    cleanup();
+    safeStatus('connecting');
 
     ws = new WebSocket(URL);
 
     ws.on('open', () => {
-      logStatus('connected');
-      ws.send(JSON.stringify({
-        event: 'subscribe',
-        pair: PAIRS,
-        subscription: { name: 'ticker' }
-      }));
+      safeStatus('connected');
+      backoffMs = 1500; // reset after success
+      lastMsgAt = Date.now();
+
+      // Subscribe to ticker
+      try {
+        ws.send(JSON.stringify({
+          event: 'subscribe',
+          pair: PAIRS,
+          subscription: { name: 'ticker' }
+        }));
+      } catch {}
     });
 
     ws.on('message', (buf) => {
+      lastMsgAt = Date.now();
+
       let msg;
       try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-      // Kraken sends events as objects, data as arrays
-      if (msg?.event) return; // subscribeStatus, heartbeat, systemStatus, etc.
+      // Events are objects (subscribeStatus, heartbeat, systemStatus)
+      if (msg && typeof msg === 'object' && !Array.isArray(msg)) {
+        // Kraken heartbeat event sometimes shows up here
+        return;
+      }
+
+      // Data messages are arrays: [channelId, data, channelName, pair]
       if (!Array.isArray(msg)) return;
 
-      // Format: [channelId, data, channelName, pair]
       const data = msg[1];
       const pair = msg[3];
       if (!data || !pair) return;
 
-      // Ticker "c" is last trade closed: ["price", "lot volume"]
       const lastStr = data?.c?.[0];
       const price = Number(lastStr);
       if (!Number.isFinite(price)) return;
@@ -63,15 +93,27 @@ function startKrakenFeed({ onTick, onStatus }) {
     });
 
     ws.on('close', () => {
-      logStatus('closed');
+      safeStatus('closed');
       if (closedByUs) return;
-      reconnectTimer = setTimeout(connect, 1500);
+      scheduleReconnect();
     });
 
     ws.on('error', () => {
-      logStatus('error');
-      try { ws.close(); } catch {}
+      safeStatus('error');
+      try { ws && ws.close(); } catch {}
+      // close handler will schedule reconnect
     });
+
+    // Watchdog: if no messages for 20s, reconnect
+    watchdog = setInterval(() => {
+      if (closedByUs) return;
+      const age = Date.now() - (lastMsgAt || 0);
+      if (age > 20000) {
+        safeStatus('error');
+        try { ws && ws.terminate(); } catch {}
+        // close handler -> reconnect
+      }
+    }, 5000);
   }
 
   connect();
@@ -79,7 +121,7 @@ function startKrakenFeed({ onTick, onStatus }) {
   return {
     stop() {
       closedByUs = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      cleanup();
       try { ws && ws.close(); } catch {}
     }
   };

@@ -10,8 +10,9 @@ const { WebSocketServer } = require('ws');
 const { ensureDb } = require('./lib/db');
 const users = require('./users/user.service');
 
-const { startKrakenFeed } = require('./services/krakenFeed');
+// ✅ Paper trader + Kraken feed
 const paperTrader = require('./services/paperTrader');
+const { startKrakenFeed } = require('./services/krakenFeed');
 
 function requireEnv(name){
   if(!process.env[name]){
@@ -26,7 +27,6 @@ users.ensureAdminFromEnv();
 
 const app = express();
 
-// --- CORS allowlist ---
 const allowlist = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -70,10 +70,11 @@ app.get('/api/paper/status', (req, res) => {
   res.json(paperTrader.snapshot());
 });
 
-// --- WebSocket server for frontend chart ---
+// --- WebSocket server ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
+// Last known prices
 let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
@@ -91,18 +92,19 @@ wss.on('connection', (ws) => {
 
 // ✅ Start paper trader
 paperTrader.start();
-// If you ever want ETH paper learning instead, set env: PAPER_SYMBOL=ETHUSDT
 
-// ✅ Start Kraken feed and broadcast ticks + feed paper trader
+// ✅ Start Kraken feed
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
-    // tick: {type:'tick', symbol:'BTCUSDT'|'ETHUSDT', price, ts}
+    // tick: { type:'tick', symbol:'BTCUSDT'|'ETHUSDT', price, ts }
     last[tick.symbol] = tick.price;
-    broadcast(tick);
 
-    // Feed the paper trader (only trades PAPER_SYMBOL)
-    paperTrader.tick(tick.symbol, tick.price);
+    // feed paper trader with symbol-based ticks (Stage B realism happens inside paperTrader)
+    paperTrader.tick(tick.symbol, tick.price, tick.ts);
+
+    // broadcast to frontend
+    broadcast(tick);
   }
 });
 

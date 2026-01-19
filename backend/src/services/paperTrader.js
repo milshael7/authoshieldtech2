@@ -1,44 +1,33 @@
 // backend/src/services/paperTrader.js
-// Stage B: Realistic friction (fees, slippage, spread, cooldown, max trades/day, max USD/trade, drawdown stop)
+// Paper trading engine + visible learning stats (confidence, ticks, decision reason)
+// Now supports MANY symbols dynamically.
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
 
-// Risk + exits
 const RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.01);
 const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
 const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
-// Friction realism
-const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);              // 0.26%
-const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);             // 8 bps = 0.08%
-const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);                 // 6 bps = 0.06%
-const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12_000);        // 12s
+const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);     // realism
+const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
+const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
+const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
+
 const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
 const MAX_TRADES_PER_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
-const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25); // 25% stop
+const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
 let state = {
   running: false,
   startBalance: START_BAL,
   balance: START_BAL,
-  equityHigh: START_BAL,
   pnl: 0,
-
   trades: [],
-  position: null, // {symbol, side:'LONG', qty, entry, entryTs, entryFee}
-
+  position: null, // {symbol, side:'LONG', qty, entry, time}
   lastPriceBySymbol: {},
-  buf: { BTCUSDT: [], ETHUSDT: [] },
-
-  limits: {
-    tradesToday: 0,
-    dayKey: null,
-    lastTradeTs: 0,
-    halted: false,
-    haltReason: null
-  },
+  buf: {},
 
   learnStats: {
     ticksSeen: 0,
@@ -48,15 +37,41 @@ let state = {
     decision: "WAIT",
     lastReason: "not_started",
     lastTickTs: null,
-    // friction stats:
     feePaid: 0,
     slippageCost: 0,
-    spreadCost: 0
+    spreadCost: 0,
+  },
+
+  limits: {
+    tradesToday: 0,
+    dayKey: dayKey(),
+    lastTradeTs: 0,
+    halted: false,
+    haltReason: null,
   }
 };
 
+function dayKey(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function resetDayIfNeeded(ts) {
+  const k = dayKey(ts);
+  if (state.limits.dayKey !== k) {
+    state.limits.dayKey = k;
+    state.limits.tradesToday = 0;
+    state.limits.lastTradeTs = 0;
+    state.limits.halted = false;
+    state.limits.haltReason = null;
+  }
+}
+
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-function mean(arr) { return arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0; }
+function mean(arr) { return arr.length ? arr.reduce((s,x)=>s+x,0)/arr.length : 0; }
 function std(arr) {
   if (arr.length < 2) return 0;
   const m = mean(arr);
@@ -64,66 +79,24 @@ function std(arr) {
   return Math.sqrt(v);
 }
 
-function dayKey(ts) {
-  // UTC date key
-  const d = new Date(ts);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
-}
-
-function ensureDaily(ts) {
-  const k = dayKey(ts);
-  if (state.limits.dayKey !== k) {
-    state.limits.dayKey = k;
-    state.limits.tradesToday = 0;
-    state.limits.halted = false;
-    state.limits.haltReason = null;
-  }
-}
-
-function resetMoney() {
-  state.startBalance = Number(process.env.PAPER_START_BALANCE || START_BAL);
-  state.balance = state.startBalance;
-  state.equityHigh = state.startBalance;
-  state.pnl = 0;
-  state.trades = [];
-  state.position = null;
-
-  state.limits.tradesToday = 0;
-  state.limits.lastTradeTs = 0;
-  state.limits.halted = false;
-  state.limits.haltReason = null;
-
-  state.learnStats.feePaid = 0;
-  state.learnStats.slippageCost = 0;
-  state.learnStats.spreadCost = 0;
-}
-
-function start() {
-  state.running = true;
-  resetMoney();
-
-  state.learnStats.ticksSeen = 0;
-  state.learnStats.confidence = 0;
-  state.learnStats.volatility = 0;
-  state.learnStats.trendEdge = 0;
-  state.learnStats.decision = "WAIT";
-  state.learnStats.lastReason = "started";
-  state.learnStats.lastTickTs = null;
-}
-
 function pushBuf(symbol, price) {
   if (!state.buf[symbol]) state.buf[symbol] = [];
   const b = state.buf[symbol];
   b.push(price);
-  while (b.length > 80) b.shift();
+  while (b.length > 60) b.shift();
 }
 
 function computeSignals(symbol) {
   const b = state.buf[symbol] || [];
-  if (b.length < 12) return { vol: 0, edge: 0, conf: 0, reason: "collecting_more_data" };
+  if (b.length < 10) {
+    return { vol: 0, edge: 0, conf: 0, reason: "collecting_more_data" };
+  }
 
   const returns = [];
-  for (let i = 1; i < b.length; i++) returns.push((b[i] - b[i - 1]) / b[i - 1]);
+  for (let i = 1; i < b.length; i++) {
+    const r = (b[i] - b[i - 1]) / (b[i - 1] || 1);
+    returns.push(r);
+  }
 
   const vol = std(returns);
   const volNorm = clamp(vol / 0.002, 0, 1);
@@ -134,94 +107,96 @@ function computeSignals(symbol) {
 
   const ticksFactor = clamp(state.learnStats.ticksSeen / WARMUP_TICKS, 0, 1);
   const trendFactor = clamp(Math.abs(edge) / (MIN_EDGE * 2), 0, 1);
-  const noisePenalty = 1 - volNorm * 0.75;
+  const noisePenalty = 1 - volNorm * 0.7;
 
-  const conf = clamp(ticksFactor * 0.55 + trendFactor * 0.55, 0, 1) * clamp(noisePenalty, 0.15, 1);
+  const conf = clamp(ticksFactor * 0.55 + trendFactor * 0.55, 0, 1) * clamp(noisePenalty, 0.2, 1);
 
-  let reason = "waiting_warmup";
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) reason = "learning_warmup";
-  else if (Math.abs(edge) < MIN_EDGE) reason = "trend_unclear";
-  else if (volNorm > 0.9) reason = "too_noisy";
-  else reason = "edge_detected";
+  let reason = "learning_warmup";
+  if (state.learnStats.ticksSeen >= WARMUP_TICKS && Math.abs(edge) < MIN_EDGE) reason = "trend_unclear";
+  else if (state.learnStats.ticksSeen >= WARMUP_TICKS && volNorm > 0.85) reason = "too_noisy";
+  else if (state.learnStats.ticksSeen >= WARMUP_TICKS) reason = "edge_detected";
 
   return { vol: volNorm, edge, conf, reason };
 }
 
-function midToFillPrice(mid, side) {
-  // Spread: buy pays ask, sell hits bid
-  const spread = (SPREAD_BP / 10_000);
-  const slip = (SLIPPAGE_BP / 10_000);
+function applyCosts(usdNotional) {
+  const fee = usdNotional * FEE_RATE;
+  const slip = usdNotional * (SLIPPAGE_BP / 10000);
+  const sprd = usdNotional * (SPREAD_BP / 10000);
 
-  const sign = side === "BUY" ? +1 : -1;
-  const spreadMove = mid * spread * sign;
-  const slipMove = mid * slip * sign;
-
-  // total worse fill
-  return mid + spreadMove + slipMove;
-}
-
-function applyFee(notionalUsd) {
-  const fee = Math.max(0, notionalUsd * FEE_RATE);
   state.learnStats.feePaid += fee;
-  return fee;
+  state.learnStats.slippageCost += slip;
+  state.learnStats.spreadCost += sprd;
+
+  return fee + slip + sprd;
 }
 
-function updateEquityHigh() {
-  if (state.balance > state.equityHigh) state.equityHigh = state.balance;
-}
+function canTrade(ts) {
+  resetDayIfNeeded(ts);
 
-function checkDrawdownStop() {
-  const dd = (state.equityHigh - state.balance) / (state.equityHigh || 1);
+  if (state.limits.halted) return { ok:false, reason: state.limits.haltReason || "halted" };
+  if (state.limits.tradesToday >= MAX_TRADES_PER_DAY) return { ok:false, reason:"max_trades_per_day" };
+  if (ts - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) return { ok:false, reason:"cooldown" };
+
+  const dd = (state.startBalance - state.balance) / (state.startBalance || 1);
   if (dd >= MAX_DRAWDOWN_PCT) {
     state.limits.halted = true;
-    state.limits.haltReason = `max_drawdown_hit_${Math.round(dd*100)}%`;
+    state.limits.haltReason = "max_drawdown_halt";
+    return { ok:false, reason:"max_drawdown_halt" };
   }
+
+  return { ok:true, reason:"ok" };
 }
 
-function canTradeNow(ts) {
-  if (state.limits.halted) return { ok: false, reason: state.limits.haltReason || "halted" };
-  if (state.limits.tradesToday >= MAX_TRADES_PER_DAY) return { ok: false, reason: "max_trades_per_day" };
-  if (ts - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) return { ok: false, reason: "cooldown" };
-  return { ok: true, reason: "ok" };
-}
+function maybeEnter(symbol, price, ts) {
+  const { vol, edge, conf, reason } = computeSignals(symbol);
 
-function enterLong(symbol, mid, ts, conf, edge, reason) {
-  const gate = canTradeNow(ts);
-  if (!gate.ok) {
+  state.learnStats.volatility = vol;
+  state.learnStats.trendEdge = edge;
+  state.learnStats.confidence = conf;
+  state.learnStats.lastReason = reason;
+
+  if (state.position) {
     state.learnStats.decision = "WAIT";
-    state.learnStats.lastReason = gate.reason;
     return;
   }
 
-  // position sizing: cap by MAX_USD_PER_TRADE
-  const riskDollars = state.balance * RISK_PCT;
-  const usdToUse = clamp(riskDollars, 10, MAX_USD_PER_TRADE);
-  const fill = midToFillPrice(mid, "BUY");
-  const qty = Math.max(0.0000001, usdToUse / fill);
-  const notional = qty * fill;
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "warmup";
+    return;
+  }
 
-  const fee = applyFee(notional);
-  state.balance -= fee; // pay fee on entry
+  const lim = canTrade(ts);
+  if (!lim.ok) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = lim.reason;
+    return;
+  }
 
-  // account friction costs (spread + slippage) just for visibility
-  const spreadCost = qty * (mid * (SPREAD_BP / 10_000));
-  const slipCost = qty * (mid * (SLIPPAGE_BP / 10_000));
-  state.learnStats.spreadCost += spreadCost;
-  state.learnStats.slippageCost += slipCost;
+  if (conf < 0.45) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "confidence_low";
+    return;
+  }
 
-  state.position = { symbol, side: "LONG", qty, entry: fill, entryTs: ts, entryFee: fee };
+  if (Math.abs(edge) < MIN_EDGE) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "trend_below_threshold";
+    return;
+  }
 
-  state.trades.push({
-    time: ts,
-    symbol,
-    type: "BUY",
-    price: fill,
-    qty,
-    fee,
-    confidence: conf,
-    trendEdge: edge,
-    note: `entry:${reason}`
-  });
+  // ✅ Notional is capped (realism)
+  const usdNotional = Math.min(MAX_USD_PER_TRADE, state.balance * RISK_PCT);
+  const qty = Math.max(0.000001, usdNotional / price);
+
+  // apply entry costs
+  const costs = applyCosts(usdNotional);
+  state.balance -= costs;
+  state.pnl -= costs;
+
+  state.position = { symbol, side: "LONG", qty, entry: price, time: ts };
+  state.trades.push({ time: ts, symbol, type: "BUY", price, qty, note: "paper_entry", costs });
 
   state.limits.tradesToday += 1;
   state.limits.lastTradeTs = ts;
@@ -230,20 +205,22 @@ function enterLong(symbol, mid, ts, conf, edge, reason) {
   state.learnStats.lastReason = "entered_long";
 }
 
-function maybeExit(mid, ts) {
+function maybeExit(symbol, price, ts) {
   const pos = state.position;
   if (!pos) return;
+  if (pos.symbol !== symbol) return;
 
-  const fillSell = midToFillPrice(mid, "SELL"); // worse sell
   const entry = pos.entry;
-  const change = (fillSell - entry) / entry;
+  const change = (price - entry) / (entry || 1);
 
   if (change >= TAKE_PROFIT_PCT || change <= -STOP_LOSS_PCT) {
-    const gross = (fillSell - entry) * pos.qty;
-    const notional = pos.qty * fillSell;
-    const fee = applyFee(notional);
+    const gross = (price - entry) * pos.qty;
 
-    const net = gross - fee;
+    const usdNotional = Math.min(MAX_USD_PER_TRADE, pos.qty * price);
+    const costs = applyCosts(usdNotional);
+
+    const net = gross - costs;
+
     state.balance += net;
     state.pnl += net;
 
@@ -251,18 +228,14 @@ function maybeExit(mid, ts) {
       time: ts,
       symbol: pos.symbol,
       type: "SELL",
-      price: fillSell,
+      price,
       qty: pos.qty,
-      fee,
       profit: net,
-      note: change >= TAKE_PROFIT_PCT ? "take_profit" : "stop_loss"
+      note: change >= TAKE_PROFIT_PCT ? "take_profit" : "stop_loss",
+      costs
     });
 
     state.position = null;
-
-    updateEquityHigh();
-    checkDrawdownStop();
-
     state.learnStats.decision = "SELL";
     state.learnStats.lastReason = change >= TAKE_PROFIT_PCT ? "tp_hit" : "sl_hit";
   } else {
@@ -270,65 +243,58 @@ function maybeExit(mid, ts) {
   }
 }
 
-// tick(symbol, price, ts) OR legacy tick(price)
-function tick(a, b, c) {
+function start() {
+  state.running = true;
+  state.startBalance = Number(process.env.PAPER_START_BALANCE || START_BAL);
+  state.balance = state.startBalance;
+  state.pnl = 0;
+  state.trades = [];
+  state.position = null;
+  state.lastPriceBySymbol = {};
+  state.buf = {};
+
+  state.learnStats = {
+    ticksSeen: 0,
+    confidence: 0,
+    volatility: 0,
+    trendEdge: 0,
+    decision: "WAIT",
+    lastReason: "started",
+    lastTickTs: null,
+    feePaid: 0,
+    slippageCost: 0,
+    spreadCost: 0,
+  };
+
+  state.limits = {
+    tradesToday: 0,
+    dayKey: dayKey(),
+    lastTradeTs: 0,
+    halted: false,
+    haltReason: null,
+  };
+}
+
+// tick(symbol, price, ts)
+function tick(symbol, price, ts = Date.now()) {
   if (!state.running) return;
 
-  let symbol, price, ts;
-  if (typeof b === "undefined") {
-    symbol = "BTCUSDT";
-    price = Number(a);
-    ts = Date.now();
-  } else {
-    symbol = String(a || "BTCUSDT");
-    price = Number(b);
-    ts = Number(c || Date.now());
-  }
-  if (!Number.isFinite(price)) return;
+  const sym = String(symbol || "BTCUSDT");
+  const p = Number(price);
+  const t = Number(ts || Date.now());
+  if (!Number.isFinite(p)) return;
 
-  ensureDaily(ts);
+  resetDayIfNeeded(t);
 
-  state.lastPriceBySymbol[symbol] = price;
+  state.lastPriceBySymbol[sym] = p;
   state.learnStats.ticksSeen += 1;
-  state.learnStats.lastTickTs = ts;
+  state.learnStats.lastTickTs = t;
 
-  pushBuf(symbol, price);
+  pushBuf(sym, p);
 
-  // Signals (always updated)
-  const { vol, edge, conf, reason } = computeSignals(symbol);
-  state.learnStats.volatility = vol;
-  state.learnStats.trendEdge = edge;
-  state.learnStats.confidence = conf;
-  state.learnStats.lastReason = reason;
-
-  // Risk mgmt first
-  maybeExit(price, ts);
-
-  // Entry
-  if (!state.position) {
-    if (state.learnStats.ticksSeen < WARMUP_TICKS) {
-      state.learnStats.decision = "WAIT";
-      state.learnStats.lastReason = "warmup";
-      return;
-    }
-    if (conf < 0.55) {
-      state.learnStats.decision = "WAIT";
-      state.learnStats.lastReason = "confidence_low";
-      return;
-    }
-    if (Math.abs(edge) < MIN_EDGE) {
-      state.learnStats.decision = "WAIT";
-      state.learnStats.lastReason = "trend_below_threshold";
-      return;
-    }
-    if (state.limits.halted) {
-      state.learnStats.decision = "WAIT";
-      state.learnStats.lastReason = state.limits.haltReason || "halted";
-      return;
-    }
-    // Stage B: LONG-only baseline
-    enterLong(symbol, price, ts, conf, edge, reason);
-  }
+  // manage exit first then entry
+  maybeExit(sym, p, t);
+  maybeEnter(sym, p, t);
 }
 
 function snapshot() {
@@ -342,7 +308,7 @@ function snapshot() {
     learnStats: state.learnStats,
     limits: state.limits,
     config: {
-      START_BAL,
+      START_BAL: state.startBalance,
       WARMUP_TICKS,
       RISK_PCT,
       TAKE_PROFIT_PCT,
@@ -354,7 +320,7 @@ function snapshot() {
       COOLDOWN_MS,
       MAX_USD_PER_TRADE,
       MAX_TRADES_PER_DAY,
-      MAX_DRAWDOWN_PCT
+      MAX_DRAWDOWN_PCT,
     }
   };
 }

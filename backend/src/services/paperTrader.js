@@ -1,4 +1,4 @@
-// backend/src/services/paperTrader.js
+/ backend/src/services/paperTrader.js
 // Paper trading engine with hard limits to prevent "million dollar jumps"
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);

@@ -13,15 +13,20 @@ const users = require('./users/user.service');
 const paperTrader = require('./services/paperTrader');
 const { startKrakenFeed } = require('./services/krakenFeed');
 
-ensureDb();
-if(!process.env.JWT_SECRET){
-  console.error("Missing required env var: JWT_SECRET");
-  process.exit(1);
+function requireEnv(name){
+  if(!process.env[name]){
+    console.error(`Missing required env var: ${name}`);
+    process.exit(1);
+  }
 }
+
+ensureDb();
+requireEnv('JWT_SECRET');
 users.ensureAdminFromEnv();
 
 const app = express();
 
+// --- CORS allowlist (set CORS_ORIGINS="https://a.com,https://b.com") ---
 const allowlist = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -41,6 +46,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
+// --- Rate limit auth endpoints ---
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.AUTH_RATELIMIT_MAX || 30),
@@ -52,7 +58,7 @@ app.get('/health', (req, res) =>
   res.json({ ok: true, name: 'autoshield-tech-backend', time: new Date().toISOString() })
 );
 
-// routes
+// Routes
 app.use('/api/auth', authLimiter, require('./routes/auth.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/manager', require('./routes/manager.routes'));
@@ -61,14 +67,17 @@ app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
 
+// Live (Kraken private)
 app.use('/api/live', require('./routes/live.routes'));
 
-// ✅ NEW: paper routes (status/config/reset)
+// ✅ Paper routes (status + reset)
 app.use('/api/paper', require('./routes/paper.routes'));
 
+// --- WebSocket server ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
+// Last known prices
 let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
@@ -84,10 +93,10 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'hello', symbols: Object.keys(last), last, ts: Date.now() }));
 });
 
-// start paper engine
+// Start paper trader
 paperTrader.start();
 
-// start feed
+// Start Kraken feed (public) -> broadcast + paper trader ticks
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {

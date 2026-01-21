@@ -10,24 +10,18 @@ const { WebSocketServer } = require('ws');
 const { ensureDb } = require('./lib/db');
 const users = require('./users/user.service');
 
-// ✅ Paper trader + Kraken feed
 const paperTrader = require('./services/paperTrader');
 const { startKrakenFeed } = require('./services/krakenFeed');
 
-function requireEnv(name){
-  if(!process.env[name]){
-    console.error(`Missing required env var: ${name}`);
-    process.exit(1);
-  }
-}
-
 ensureDb();
-requireEnv('JWT_SECRET');
+if(!process.env.JWT_SECRET){
+  console.error("Missing required env var: JWT_SECRET");
+  process.exit(1);
+}
 users.ensureAdminFromEnv();
 
 const app = express();
 
-// --- CORS allowlist (set CORS_ORIGINS="https://a.com,https://b.com") ---
 const allowlist = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -47,7 +41,6 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-// --- Rate limit auth endpoints ---
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.AUTH_RATELIMIT_MAX || 30),
@@ -59,7 +52,7 @@ app.get('/health', (req, res) =>
   res.json({ ok: true, name: 'autoshield-tech-backend', time: new Date().toISOString() })
 );
 
-// ✅ routes
+// routes
 app.use('/api/auth', authLimiter, require('./routes/auth.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/manager', require('./routes/manager.routes'));
@@ -67,30 +60,16 @@ app.use('/api/company', require('./routes/company.routes'));
 app.use('/api/me', require('./routes/me.routes'));
 app.use('/api/trading', require('./routes/trading.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
+
 app.use('/api/live', require('./routes/live.routes'));
 
-// ✅ Paper status endpoint
-app.get('/api/paper/status', (req, res) => {
-  res.json(paperTrader.snapshot());
-});
+// ✅ NEW: paper routes (status/config/reset)
+app.use('/api/paper', require('./routes/paper.routes'));
 
-// --- WebSocket server ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws/market' });
 
-// ✅ Track last known prices for ALL 10 symbols (for hello snapshot)
-let last = {
-  BTCUSDT: 65000,
-  ETHUSDT: 3500,
-  SOLUSDT: 150,
-  XRPUSDT: 1,
-  ADAUSDT: 0.5,
-  DOTUSDT: 7,
-  LINKUSDT: 15,
-  LTCUSDT: 80,
-  BCHUSDT: 250,
-  XLMUSDT: 0.12,
-};
+let last = { BTCUSDT: 65000, ETHUSDT: 3500 };
 
 function broadcast(obj) {
   const payload = JSON.stringify(obj);
@@ -105,20 +84,15 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'hello', symbols: Object.keys(last), last, ts: Date.now() }));
 });
 
-// ✅ Start paper trader
+// start paper engine
 paperTrader.start();
 
-// ✅ Start Kraken feed (public) -> broadcast + paper trader ticks
+// start feed
 startKrakenFeed({
   onStatus: (s) => console.log('[kraken]', s),
   onTick: (tick) => {
-    // tick: { type:'tick', symbol:'BTCUSDT'|'ETHUSDT'|..., price, ts }
     last[tick.symbol] = tick.price;
-
-    // feed paper trader
     paperTrader.tick(tick.symbol, tick.price, tick.ts);
-
-    // broadcast to frontend
     broadcast(tick);
   }
 });

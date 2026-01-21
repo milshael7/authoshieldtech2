@@ -1,52 +1,51 @@
 // backend/src/routes/paper.routes.js
-// Paper trading control routes (status + reset)
-// Uses the NON-RESETTING paperTrader "brain"
+// Paper endpoints: status + hard reset
+// Safe: reset is locked behind an optional admin key (recommended)
 
 const express = require('express');
 const router = express.Router();
 
 const paperTrader = require('../services/paperTrader');
-const { authRequired, requireRole } = require('../middleware/auth');
 
-/**
- * GET /api/paper/status
- * Public-ish (logged-in) read-only snapshot
- */
-router.get('/status', authRequired, (req, res) => {
+// OPTIONAL: simple protection so random users can’t reset your paper brain.
+// Set env PAPER_RESET_KEY to something long. Then call:
+// POST /api/paper/reset  with header:  x-reset-key: <your key>
+function resetAllowed(req) {
+  const key = String(process.env.PAPER_RESET_KEY || '').trim();
+  if (!key) return true; // if you don't set it, reset is open (not recommended)
+  const sent = String(req.headers['x-reset-key'] || '').trim();
+  return sent && sent === key;
+}
+
+// GET /api/paper/status  -> same as the old /api/paper/status you already call
+router.get('/status', (req, res) => {
   try {
-    res.json(paperTrader.snapshot());
+    return res.json(paperTrader.snapshot());
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e?.message || 'Failed to load paper status'
-    });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-/**
- * POST /api/paper/reset
- * ADMIN ONLY
- * Hard reset paper wallet + learning stats
- * (Does NOT affect live trading)
- */
-router.post(
-  '/reset',
-  authRequired,
-  requireRole('Admin'),
-  (req, res) => {
-    try {
-      paperTrader.hardReset();
-      res.json({
-        ok: true,
-        message: 'Paper trader reset successfully'
-      });
-    } catch (e) {
-      res.status(500).json({
+// POST /api/paper/reset -> wipe paper wallet + trades + learning buffers (paper only)
+router.post('/reset', (req, res) => {
+  try {
+    if (!resetAllowed(req)) {
+      return res.status(403).json({
         ok: false,
-        error: e?.message || 'Reset failed'
+        error: 'Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY on backend).'
       });
     }
+
+    paperTrader.hardReset();
+    return res.json({
+      ok: true,
+      message: 'Paper wallet reset complete.',
+      stateFile: process.env.PAPER_STATE_PATH || '(default from paperTrader)',
+      snapshot: paperTrader.snapshot()
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-);
+});
 
 module.exports = router;

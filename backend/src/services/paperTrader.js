@@ -1,10 +1,10 @@
 // backend/src/services/paperTrader.js
-// Paper trading engine with REAL TIME wallet flow rules:
-// - Trading wallet starts funded, storehouse starts 0
-// - Trading wallet has a CAP; overflow goes to STOREHOUSE
-// - If trading wallet drops below TRIGGER, storehouse top-ups the trading wallet
-// - Trades sized by % (owner can override risk % anytime)
+// Paper trading engine with:
+// - Win/Loss accounting + fees realism
+// - FIX: prevents cross-symbol exits (the "millions/billions jump" bug)
 // - Persistence uses PAPER_STATE_PATH (Render Disk recommended)
+// - NEW: Daily loss logic + recovery mode
+//   If AI loses 2 trades in a day -> risk% resets to 3% and climbs back up as losses are repaid.
 
 const fs = require("fs");
 const path = require("path");
@@ -15,31 +15,35 @@ const START_STOREHOUSE_WALLET = Number(process.env.PAPER_STOREHOUSE_START || 0);
 
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
 
-// % sizing
-const BASE_RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.12);     // 12% base (your example)
-const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.50);  // 50% max
+// risk % (your plan)
+const RECOVERY_BASE_RISK_PCT = Number(process.env.PAPER_RECOVERY_BASE_RISK_PCT || 0.03); // 3%
+const BASE_RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.12); // normal base (example 12%)
+const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.50); // 50%
 
-// take profit / stop loss
+// daily loss rule
+const DAILY_LOSS_RESET_COUNT = Number(process.env.PAPER_DAILY_LOSS_RESET_COUNT || 2);
+
+// TP/SL
 const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
 const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
-// realism knobs
+// realism
 const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
 const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
 const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
 const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
 
-// safety
+// safety/limits
 const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
-const MAX_TRADES_PER_DAY_DEFAULT = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 200); // paper can be high
+const MAX_TRADES_PER_DAY_DEFAULT = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 200); // paper can be higher
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-// anti “tiny trades / fee dominance”
+// anti tiny-trades/fee-dominance
 const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 50);
 const MIN_NET_TP_USD = Number(process.env.PAPER_MIN_NET_TP_USD || 1.0);
 
-// wallet flow rules (your numbers)
+// wallet flow rules (optional; can keep simple for now)
 const TRADING_WALLET_CAP_DEFAULT = Number(process.env.PAPER_TRADING_WALLET_CAP || 200000);
 const TOPUP_TRIGGER_DEFAULT = Number(process.env.PAPER_TOPUP_TRIGGER || 500000);
 const TOPUP_AMOUNT_DEFAULT = Number(process.env.PAPER_TOPUP_AMOUNT || 5000);
@@ -103,9 +107,11 @@ function defaultState() {
 
     config: {
       WARMUP_TICKS,
+      RECOVERY_BASE_RISK_PCT,
       BASE_RISK_PCT,
       MAX_RISK_PCT,
-      MANUAL_RISK_PCT: null, // if set, overrides auto risk logic
+      MANUAL_RISK_PCT: null, // if set, overrides all auto risk
+      DAILY_LOSS_RESET_COUNT,
       TAKE_PROFIT_PCT,
       STOP_LOSS_PCT,
       MIN_EDGE,
@@ -132,7 +138,14 @@ function defaultState() {
       haltReason: null
     },
 
-    streak: { winsInRow: 0, lossesInRow: 0 },
+    // NEW: daily + recovery accounting
+    daily: {
+      dayKey: dayKey(Date.now()),
+      lossesToday: 0,
+      recoveryMode: false,
+      recoveryDebtUsd: 0,      // current debt remaining
+      recoveryDebtStartUsd: 0, // initial debt when recovery began (for % progress)
+    },
 
     buf: { BTCUSDT: [], ETHUSDT: [] }
   };
@@ -176,14 +189,22 @@ function loadNow() {
       learnStats: { ...base.learnStats, ...(parsed.learnStats || {}) },
       limits: { ...base.limits, ...(parsed.limits || {}) },
       config: { ...base.config, ...(parsed.config || {}) },
-      streak: { ...base.streak, ...(parsed.streak || {}) },
+      daily: { ...base.daily, ...(parsed.daily || {}) },
       buf: { ...base.buf, ...(parsed.buf || {}) }
     };
 
+    // ensure daily matches today
     const dk = dayKey(Date.now());
     if (state.limits.dayKey !== dk) {
       state.limits.dayKey = dk;
       state.limits.tradesToday = 0;
+    }
+    if (state.daily.dayKey !== dk) {
+      state.daily.dayKey = dk;
+      state.daily.lossesToday = 0;
+      state.daily.recoveryMode = false;
+      state.daily.recoveryDebtUsd = 0;
+      state.daily.recoveryDebtStartUsd = 0;
     }
 
     state.pnl = (state.realized?.net || 0);
@@ -245,6 +266,7 @@ function applyEntryCosts(usdNotional) {
   const spreadPct = state.config.SPREAD_BP / 10000;
   const slipPct = state.config.SLIPPAGE_BP / 10000;
   const fee = usdNotional * state.config.FEE_RATE;
+
   const spreadCost = usdNotional * spreadPct;
   const slippageCost = usdNotional * slipPct;
 
@@ -260,61 +282,24 @@ function applyExitFee(usdNotional) {
   return fee;
 }
 
-// ---------- WALLET FLOW RULES ----------
-function sweepOverflowToStorehouse() {
-  const cap = Number(state.config.TRADING_WALLET_CAP || 0);
-  if (!cap || cap <= 0) return;
-
-  if (state.wallets.trading > cap) {
-    const overflow = state.wallets.trading - cap;
-    state.wallets.trading -= overflow;
-    state.wallets.storehouse += overflow;
-
-    state.trades.push({
-      time: Date.now(),
-      symbol: "WALLET",
-      type: "SWEEP",
-      price: 0,
-      qty: 0,
-      usd: overflow,
-      note: "overflow_to_storehouse"
-    });
-  }
-}
-
-function maybeTopUpFromStorehouse() {
-  const trigger = Number(state.config.TOPUP_TRIGGER || 0);
-  const amt = Number(state.config.TOPUP_AMOUNT || 0);
-  if (!trigger || trigger <= 0) return;
-  if (!amt || amt <= 0) return;
-
-  // top-up when trading wallet falls below trigger
-  if (state.wallets.trading >= trigger) return;
-  if (state.wallets.storehouse <= 0) return;
-
-  const transfer = Math.min(amt, state.wallets.storehouse);
-  state.wallets.storehouse -= transfer;
-  state.wallets.trading += transfer;
-
-  state.trades.push({
-    time: Date.now(),
-    symbol: "WALLET",
-    type: "TOPUP",
-    price: 0,
-    qty: 0,
-    usd: transfer,
-    note: "storehouse_to_trading_wallet"
-  });
-}
-
-// ---------- LIMITS ----------
+// ---------- DAILY CHECK ----------
 function checkDaily(ts) {
   const dk = dayKey(ts);
+
   if (state.limits.dayKey !== dk) {
     state.limits.dayKey = dk;
     state.limits.tradesToday = 0;
   }
+
+  if (state.daily.dayKey !== dk) {
+    state.daily.dayKey = dk;
+    state.daily.lossesToday = 0;
+    state.daily.recoveryMode = false;
+    state.daily.recoveryDebtUsd = 0;
+    state.daily.recoveryDebtStartUsd = 0;
+  }
 }
+
 function checkDrawdown() {
   const peak = state.startBalance;
   const dd = (peak - state.wallets.trading) / peak;
@@ -323,26 +308,37 @@ function checkDrawdown() {
     state.limits.haltReason = `max_drawdown_${Math.round(state.config.MAX_DRAWDOWN_PCT * 100)}%`;
   }
 }
-function canTradeProfitablyAtTP() {
-  const rt = totalRoundTripCostRate();
-  return state.config.TAKE_PROFIT_PCT > rt;
-}
 
-// ---------- RISK % LOGIC (AUTO + OWNER OVERRIDE) ----------
+// ---------- RISK % LOGIC (MANUAL OVERRIDE + DAILY RECOVERY MODE) ----------
 function currentRiskPct() {
+  // Owner override wins over everything
   const manual = state.config.MANUAL_RISK_PCT;
   if (manual !== null && manual !== undefined && Number.isFinite(Number(manual))) {
     return clamp(Number(manual), 0.005, state.config.MAX_RISK_PCT);
   }
 
-  const base = state.config.BASE_RISK_PCT;
-  const max = state.config.MAX_RISK_PCT;
+  // Recovery mode: start at 3% and climb to max as debt is repaid
+  if (state.daily.recoveryMode) {
+    const base = clamp(state.config.RECOVERY_BASE_RISK_PCT, 0.005, state.config.MAX_RISK_PCT);
+    const max = state.config.MAX_RISK_PCT;
 
-  // losses reduce risk quickly; wins can increase slowly
-  const lossPenalty = Math.min(0.03 * state.streak.lossesInRow, base * 0.85);
-  const winBoost = Math.min(0.01 * state.streak.winsInRow, max - base);
+    const startDebt = Math.max(1e-9, Number(state.daily.recoveryDebtStartUsd || 0));
+    const debtNow = Math.max(0, Number(state.daily.recoveryDebtUsd || 0));
 
-  return clamp(base - lossPenalty + winBoost, 0.005, max);
+    // progress = 0 when debt unchanged, 1 when fully repaid
+    const progress = clamp((startDebt - debtNow) / startDebt, 0, 1);
+
+    return clamp(base + progress * (max - base), base, max);
+  }
+
+  // Normal mode: use your base->max logic (simple)
+  return clamp(state.config.BASE_RISK_PCT, 0.005, state.config.MAX_RISK_PCT);
+}
+
+// ---------- TRADE PROFITABILITY CHECK ----------
+function canTradeProfitablyAtTP() {
+  const rt = totalRoundTripCostRate();
+  return state.config.TAKE_PROFIT_PCT > rt;
 }
 
 // ---------- TRADING ----------
@@ -399,10 +395,11 @@ function maybeEnter(symbol, price, ts) {
   const pct = currentRiskPct();
   let usdNotional = state.wallets.trading * pct;
 
+  // enforce min/max sizing
   usdNotional = Math.max(usdNotional, state.config.MIN_USD_PER_TRADE);
   usdNotional = Math.min(usdNotional, state.config.MAX_USD_PER_TRADE);
 
-  // net-at-TP must be meaningful
+  // expected net at TP must be meaningful
   const rt = totalRoundTripCostRate();
   const netPerUsdAtTP = state.config.TAKE_PROFIT_PCT - rt;
   const expectedNetAtTP = usdNotional * Math.max(0, netPerUsdAtTP);
@@ -412,7 +409,7 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  // must be able to pay entry cost
+  // must afford entry costs
   const worstEntryCosts = usdNotional * entryCostRate();
   if (state.wallets.trading <= worstEntryCosts + 1) {
     state.learnStats.decision = "WAIT";
@@ -442,7 +439,7 @@ function maybeEnter(symbol, price, ts) {
     qty,
     usd: usdNotional,
     cost: entryCosts,
-    note: `paper_entry_${Math.round(pct * 10000) / 100}%`
+    note: state.daily.recoveryMode ? "entry_recovery_mode" : "entry_normal_mode"
   });
 
   state.limits.lastTradeTs = ts;
@@ -452,11 +449,49 @@ function maybeEnter(symbol, price, ts) {
   state.learnStats.lastReason = "entered_long";
 }
 
+function onClosedTrade(net) {
+  // net < 0 => loss
+  if (net < 0) {
+    state.daily.lossesToday += 1;
+
+    // if we hit the daily loss reset count, enter recovery mode
+    if (state.daily.lossesToday >= state.config.DAILY_LOSS_RESET_COUNT) {
+      // add this loss into debt pool (debt is positive)
+      const addDebt = Math.abs(net);
+
+      // if first time entering recovery today, set start debt snapshot
+      if (!state.daily.recoveryMode) {
+        state.daily.recoveryMode = true;
+        state.daily.recoveryDebtUsd = addDebt;
+        state.daily.recoveryDebtStartUsd = addDebt;
+      } else {
+        // already in recovery, just increase debt (and start debt too so progress remains consistent)
+        state.daily.recoveryDebtUsd += addDebt;
+        state.daily.recoveryDebtStartUsd += addDebt;
+      }
+    } else {
+      // not yet in recovery, do nothing special
+    }
+  } else if (net > 0) {
+    // win: if in recovery, pay down debt
+    if (state.daily.recoveryMode) {
+      state.daily.recoveryDebtUsd -= net;
+
+      if (state.daily.recoveryDebtUsd <= 0) {
+        // debt fully repaid -> exit recovery mode (but lossesToday stays counted for the day)
+        state.daily.recoveryMode = false;
+        state.daily.recoveryDebtUsd = 0;
+        state.daily.recoveryDebtStartUsd = 0;
+      }
+    }
+  }
+}
+
 function maybeExit(symbol, price, ts) {
   const pos = state.position;
   if (!pos) return;
 
-  // critical: prevent cross-symbol exits (the “millions/billions jump” bug)
+  // critical: prevent cross-symbol exits
   if (pos.symbol !== symbol) return;
 
   const entry = pos.entry;
@@ -469,21 +504,23 @@ function maybeExit(symbol, price, ts) {
     const exitFee = applyExitFee(exitNotionalUsd);
     const net = gross - (pos.entryCosts || 0) - exitFee;
 
+    // apply P&L to trading wallet
     state.wallets.trading += net;
+
+    // record totals
     state.realized.net += net;
     state.pnl = state.realized.net;
 
     if (net >= 0) {
       state.realized.wins += 1;
       state.realized.grossProfit += net;
-      state.streak.winsInRow += 1;
-      state.streak.lossesInRow = 0;
     } else {
       state.realized.losses += 1;
       state.realized.grossLoss += net;
-      state.streak.lossesInRow += 1;
-      state.streak.winsInRow = 0;
     }
+
+    // NEW: daily recovery logic
+    onClosedTrade(net);
 
     state.trades.push({
       time: ts,
@@ -501,10 +538,6 @@ function maybeExit(symbol, price, ts) {
     state.position = null;
 
     checkDrawdown();
-
-    // wallet flow after each completed trade
-    sweepOverflowToStorehouse();
-    maybeTopUpFromStorehouse();
 
     state.learnStats.decision = "SELL";
     state.learnStats.lastReason = change >= state.config.TAKE_PROFIT_PCT ? "tp_hit" : "sl_hit";
@@ -537,6 +570,7 @@ function tick(a, b, c) {
 
   pushBuf(symbol, price);
 
+  // exit before enter
   maybeExit(symbol, price, ts);
   maybeEnter(symbol, price, ts);
 
@@ -556,14 +590,14 @@ function hardReset() {
   saveNow();
 }
 
+// config update (optional)
 function updateConfig(patch = {}) {
   state.config = { ...state.config, ...patch };
 
-  // clamp %
-  state.config.BASE_RISK_PCT = clamp(Number(state.config.BASE_RISK_PCT || 0.12), 0.005, 0.9);
+  state.config.RECOVERY_BASE_RISK_PCT = clamp(Number(state.config.RECOVERY_BASE_RISK_PCT || 0.03), 0.005, 0.95);
+  state.config.BASE_RISK_PCT = clamp(Number(state.config.BASE_RISK_PCT || 0.12), 0.005, 0.95);
   state.config.MAX_RISK_PCT = clamp(Number(state.config.MAX_RISK_PCT || 0.5), state.config.BASE_RISK_PCT, 0.95);
 
-  // manual risk can be null or number
   if (state.config.MANUAL_RISK_PCT === "" || state.config.MANUAL_RISK_PCT === undefined) {
     state.config.MANUAL_RISK_PCT = null;
   }
@@ -572,12 +606,7 @@ function updateConfig(patch = {}) {
     state.config.MANUAL_RISK_PCT = Number.isFinite(v) ? clamp(v, 0.005, state.config.MAX_RISK_PCT) : null;
   }
 
-  // cap and topup
-  state.config.TRADING_WALLET_CAP = Math.max(0, Number(state.config.TRADING_WALLET_CAP || TRADING_WALLET_CAP_DEFAULT));
-  state.config.TOPUP_TRIGGER = Math.max(0, Number(state.config.TOPUP_TRIGGER || TOPUP_TRIGGER_DEFAULT));
-  state.config.TOPUP_AMOUNT = Math.max(0, Number(state.config.TOPUP_AMOUNT || TOPUP_AMOUNT_DEFAULT));
-
-  // trades/day
+  state.config.DAILY_LOSS_RESET_COUNT = Math.max(1, Number(state.config.DAILY_LOSS_RESET_COUNT || 2));
   state.config.MAX_TRADES_PER_DAY = Math.max(1, Number(state.config.MAX_TRADES_PER_DAY || MAX_TRADES_PER_DAY_DEFAULT));
 
   scheduleSave();
@@ -596,6 +625,7 @@ function snapshot() {
     lastPriceBySymbol: state.lastPriceBySymbol,
     learnStats: state.learnStats,
     limits: state.limits,
+    daily: state.daily,
     config: state.config,
     riskPctNow: currentRiskPct()
   };

@@ -1,66 +1,55 @@
 // backend/src/services/paperTrader.js
-// Paper trading engine with:
-// - Win/Loss accounting + fees realism
-// - FIX: prevents cross-symbol exits (the "millions/billions jump" bug)
-// - Persistence uses PAPER_STATE_PATH (Render Disk recommended)
-// - NEW: Daily loss logic + recovery mode
-//   If AI loses 2 trades in a day -> risk% resets to 3% and climbs back up as losses are repaid.
+// Paper trading engine + tiered % growth + storehouse overflow + 50% top-up + persistence ("brain")
+// FIXES:
+//  - prevents cross-symbol exits (only exit if tick symbol matches position symbol)
+//  - persistence path safe for Render disk via PAPER_STATE_PATH
+//  - minimum trade size so fees don’t dominate
+//  - tier logic: 100k -> 200k -> 300k -> 400k -> 500k (step=100k, cap=500k)
 
-const fs = require("fs");
-const path = require("path");
+const fs = require('fs');
+const path = require('path');
 
-// ---------- ENV DEFAULTS ----------
-const START_TRADING_WALLET = Number(process.env.PAPER_START_BALANCE || 100000);
-const START_STOREHOUSE_WALLET = Number(process.env.PAPER_STOREHOUSE_START || 0);
+// ---- Core tier rules ----
+const TIER_STEP_USD = Number(process.env.PAPER_TIER_STEP_USD || 100000);     // 100k
+const MAX_TRADING_WALLET = Number(process.env.PAPER_MAX_WALLET_USD || 500000); // 500k
+const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);        // 100k start
+const TOPUP_TRIGGER_PCT = Number(process.env.PAPER_TOPUP_TRIGGER_PCT || 0.5); // 50% drop triggers top-up to tier base
 
+// Storehouse starts at 0 by default (you can set if you want extra buffer in paper)
+const STOREHOUSE_START = Number(process.env.PAPER_STOREHOUSE_START || 0);
+
+// ---- Learning / signals ----
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
-
-// risk % (your plan)
-const RECOVERY_BASE_RISK_PCT = Number(process.env.PAPER_RECOVERY_BASE_RISK_PCT || 0.03); // 3%
-const BASE_RISK_PCT = Number(process.env.PAPER_RISK_PCT || 0.12); // normal base (example 12%)
-const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.50); // 50%
-
-// daily loss rule
-const DAILY_LOSS_RESET_COUNT = Number(process.env.PAPER_DAILY_LOSS_RESET_COUNT || 2);
-
-// TP/SL
-const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
-const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 const MIN_EDGE = Number(process.env.PAPER_MIN_TREND_EDGE || 0.0007);
 
-// realism
-const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);
-const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
-const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
-const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
+// ---- Risk growth inside tier ----
+const BASE_RISK_PCT = Number(process.env.PAPER_BASE_RISK_PCT || 0.03);  // 3%
+const MAX_RISK_PCT = Number(process.env.PAPER_MAX_RISK_PCT || 0.50);    // 50%
 
-// safety/limits
-const MAX_USD_PER_TRADE = Number(process.env.PAPER_MAX_USD_PER_TRADE || 300);
-const MAX_TRADES_PER_DAY_DEFAULT = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 200); // paper can be higher
-const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
+// ---- Exit rules ----
+const TAKE_PROFIT_PCT = Number(process.env.PAPER_TP_PCT || 0.004);
+const STOP_LOSS_PCT = Number(process.env.PAPER_SL_PCT || 0.003);
 
-// anti tiny-trades/fee-dominance
-const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 50);
-const MIN_NET_TP_USD = Number(process.env.PAPER_MIN_NET_TP_USD || 1.0);
+// ---- Realism knobs ----
+const FEE_RATE = Number(process.env.PAPER_FEE_RATE || 0.0026);      // per side
+const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);     // basis points
+const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);         // basis points
+const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000); // min gap between entries
 
-// wallet flow rules (optional; can keep simple for now)
-const TRADING_WALLET_CAP_DEFAULT = Number(process.env.PAPER_TRADING_WALLET_CAP || 200000);
-const TOPUP_TRIGGER_DEFAULT = Number(process.env.PAPER_TOPUP_TRIGGER || 500000);
-const TOPUP_AMOUNT_DEFAULT = Number(process.env.PAPER_TOPUP_AMOUNT || 5000);
+// ---- Safety/limits ----
+const MAX_TRADES_PER_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 240); // paper can trade a lot
+const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.60);   // for paper safety only
 
-// persistence path
+// ---- Fee dominance fix ----
+const MIN_TRADE_USD = Number(process.env.PAPER_MIN_TRADE_USD || 25); // enforce min order so fees don’t eat it
+const MAX_TRADE_USD = Number(process.env.PAPER_MAX_TRADE_USD || 5000); // hard cap per trade
+const RISK_SCALE = Number(process.env.PAPER_RISK_SCALE || 1.0); // owner knob (1.0 normal)
+
+// ---- Persistence ("brain") ----
 const STATE_FILE =
   (process.env.PAPER_STATE_PATH && String(process.env.PAPER_STATE_PATH).trim()) ||
-  path.join("/tmp", "paper_state.json");
+  path.join('/tmp', 'paper_state.json');
 
-// ---------- HELPERS ----------
-function dayKey(ts) {
-  const d = new Date(ts);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 function mean(arr) { return arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0; }
 function std(arr) {
@@ -75,26 +64,102 @@ function ensureDirFor(filePath) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   } catch {}
 }
+function dayKey(ts) {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
 
-// ---------- STATE ----------
+// ---- Tier helpers ----
+function getTierBase(balanceUsd) {
+  // Tier base is in steps of 100k, min 100k, max 500k
+  const b = Number(balanceUsd) || START_BAL;
+  const capped = clamp(b, START_BAL, MAX_TRADING_WALLET);
+  const steps = Math.floor((capped - 1) / TIER_STEP_USD);
+  const base = START_BAL + steps * TIER_STEP_USD;
+  return clamp(base, START_BAL, MAX_TRADING_WALLET);
+}
+
+function getTierCeil(tierBase) {
+  return clamp(tierBase + TIER_STEP_USD, START_BAL, MAX_TRADING_WALLET);
+}
+
+function pctWithinTier(balanceUsd, tierBase) {
+  const ceil = getTierCeil(tierBase);
+  if (ceil === tierBase) return 1;
+  return clamp((balanceUsd - tierBase) / (ceil - tierBase), 0, 1);
+}
+
+function currentRiskPct(balanceUsd, tierBase, riskPctFloor) {
+  // riskPctFloor is usually 3%, but can reset after loss streak
+  const prog = pctWithinTier(balanceUsd, tierBase);
+  const maxPct = clamp(MAX_RISK_PCT, riskPctFloor, 0.99);
+  const now = riskPctFloor + prog * (maxPct - riskPctFloor);
+  return clamp(now, riskPctFloor, maxPct);
+}
+
+// ---- Costs ----
+function applyEntryCosts(state, usdNotional) {
+  const spreadPct = SPREAD_BP / 10000;
+  const slipPct = SLIPPAGE_BP / 10000;
+  const fee = usdNotional * FEE_RATE;
+
+  const spreadCost = usdNotional * spreadPct;
+  const slippageCost = usdNotional * slipPct;
+
+  state.costs.feePaid += fee;
+  state.costs.spreadCost += spreadCost;
+  state.costs.slippageCost += slippageCost;
+
+  return fee + spreadCost + slippageCost;
+}
+
+function applyExitFee(state, usdNotional) {
+  const fee = usdNotional * FEE_RATE;
+  state.costs.feePaid += fee;
+  return fee;
+}
+
+// ---- Default state ----
 function defaultState() {
+  const tierBase = getTierBase(START_BAL);
   return {
     running: true,
 
-    wallets: {
-      trading: START_TRADING_WALLET,
-      storehouse: START_STOREHOUSE_WALLET
+    // Trading wallet (capped at 500k). Anything above goes to storehouse.
+    balance: START_BAL,
+    startBalance: START_BAL,
+    storehouse: STOREHOUSE_START,
+
+    // Tier and risk tracking
+    tierBase,
+    tierCeil: getTierCeil(tierBase),
+    riskPctFloor: BASE_RISK_PCT, // resets back to 3% on loss-streak events
+    riskPctNow: BASE_RISK_PCT,
+
+    // Stats
+    pnl: 0,
+    realized: {
+      wins: 0,
+      losses: 0,
+      grossProfit: 0,
+      grossLoss: 0, // negative
+      net: 0
+    },
+    costs: {
+      feePaid: 0,
+      slippageCost: 0,
+      spreadCost: 0
     },
 
-    startBalance: START_TRADING_WALLET,
-    pnl: 0,
-    realized: { wins: 0, losses: 0, grossProfit: 0, grossLoss: 0, net: 0 },
-    costs: { feePaid: 0, slippageCost: 0, spreadCost: 0 },
-
+    // Trades/position
     trades: [],
-    position: null, // {symbol, qty, entry, entryTs, entryNotionalUsd, entryCosts}
+    position: null, // {symbol, side:'LONG', qty, entry, entryTs, entryNotionalUsd, entryCosts}
     lastPriceBySymbol: {},
 
+    // Learning stats
     learnStats: {
       ticksSeen: 0,
       confidence: 0,
@@ -103,57 +168,53 @@ function defaultState() {
       decision: "WAIT",
       lastReason: "boot",
       lastTickTs: null,
+      riskPctNow: BASE_RISK_PCT
     },
 
-    config: {
-      WARMUP_TICKS,
-      RECOVERY_BASE_RISK_PCT,
-      BASE_RISK_PCT,
-      MAX_RISK_PCT,
-      MANUAL_RISK_PCT: null, // if set, overrides all auto risk
-      DAILY_LOSS_RESET_COUNT,
-      TAKE_PROFIT_PCT,
-      STOP_LOSS_PCT,
-      MIN_EDGE,
-      FEE_RATE,
-      SLIPPAGE_BP,
-      SPREAD_BP,
-      COOLDOWN_MS,
-      MAX_USD_PER_TRADE,
-      MAX_TRADES_PER_DAY: MAX_TRADES_PER_DAY_DEFAULT,
-      MAX_DRAWDOWN_PCT,
-      MIN_USD_PER_TRADE,
-      MIN_NET_TP_USD,
-      TRADING_WALLET_CAP: TRADING_WALLET_CAP_DEFAULT,
-      TOPUP_TRIGGER: TOPUP_TRIGGER_DEFAULT,
-      TOPUP_AMOUNT: TOPUP_AMOUNT_DEFAULT,
-      STATE_FILE
-    },
-
+    // Limits
     limits: {
       tradesToday: 0,
       dayKey: dayKey(Date.now()),
       lastTradeTs: 0,
       halted: false,
-      haltReason: null
+      haltReason: null,
+      lossStreak: 0,        // IMPORTANT: if reaches 3, risk floor snaps back to 3%
+      lossStreakTrigger: 3,
     },
 
-    // NEW: daily + recovery accounting
-    daily: {
-      dayKey: dayKey(Date.now()),
-      lossesToday: 0,
-      recoveryMode: false,
-      recoveryDebtUsd: 0,      // current debt remaining
-      recoveryDebtStartUsd: 0, // initial debt when recovery began (for % progress)
-    },
+    // Buffers per symbol
+    buf: { BTCUSDT: [], ETHUSDT: [] },
 
-    buf: { BTCUSDT: [], ETHUSDT: [] }
+    // Config (for UI/debug)
+    config: {
+      START_BAL,
+      TIER_STEP_USD,
+      MAX_TRADING_WALLET,
+      TOPUP_TRIGGER_PCT,
+      STOREHOUSE_START,
+      WARMUP_TICKS,
+      MIN_EDGE,
+      BASE_RISK_PCT,
+      MAX_RISK_PCT,
+      TAKE_PROFIT_PCT,
+      STOP_LOSS_PCT,
+      FEE_RATE,
+      SLIPPAGE_BP,
+      SPREAD_BP,
+      COOLDOWN_MS,
+      MIN_TRADE_USD,
+      MAX_TRADE_USD,
+      MAX_TRADES_PER_DAY,
+      MAX_DRAWDOWN_PCT,
+      RISK_SCALE,
+      STATE_FILE
+    }
   };
 }
 
 let state = defaultState();
 
-// ---------- PERSISTENCE ----------
+// ---- Persistence (debounced) ----
 let saveTimer = null;
 function scheduleSave() {
   if (saveTimer) return;
@@ -162,52 +223,58 @@ function scheduleSave() {
     saveNow();
   }, 1200);
 }
+
 function saveNow() {
   try {
     ensureDirFor(STATE_FILE);
-    const safe = { ...state, trades: state.trades.slice(-800), buf: state.buf };
-    const tmp = STATE_FILE + ".tmp";
+    const safe = {
+      ...state,
+      trades: state.trades.slice(-1500)
+    };
+    const tmp = STATE_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(safe, null, 2));
     fs.renameSync(tmp, STATE_FILE);
-  } catch {}
+  } catch {
+    // never crash backend due to persistence
+  }
 }
+
 function loadNow() {
   try {
     ensureDirFor(STATE_FILE);
     if (!fs.existsSync(STATE_FILE)) return false;
 
-    const raw = fs.readFileSync(STATE_FILE, "utf-8");
+    const raw = fs.readFileSync(STATE_FILE, 'utf-8');
     const parsed = JSON.parse(raw);
 
     const base = defaultState();
     state = {
       ...base,
       ...parsed,
-      wallets: { ...base.wallets, ...(parsed.wallets || {}) },
       realized: { ...base.realized, ...(parsed.realized || {}) },
       costs: { ...base.costs, ...(parsed.costs || {}) },
       learnStats: { ...base.learnStats, ...(parsed.learnStats || {}) },
       limits: { ...base.limits, ...(parsed.limits || {}) },
       config: { ...base.config, ...(parsed.config || {}) },
-      daily: { ...base.daily, ...(parsed.daily || {}) },
       buf: { ...base.buf, ...(parsed.buf || {}) }
     };
 
-    // ensure daily matches today
+    // daily reset
     const dk = dayKey(Date.now());
     if (state.limits.dayKey !== dk) {
       state.limits.dayKey = dk;
       state.limits.tradesToday = 0;
-    }
-    if (state.daily.dayKey !== dk) {
-      state.daily.dayKey = dk;
-      state.daily.lossesToday = 0;
-      state.daily.recoveryMode = false;
-      state.daily.recoveryDebtUsd = 0;
-      state.daily.recoveryDebtStartUsd = 0;
+      state.limits.lossStreak = 0;
     }
 
+    // keep pnl consistent
     state.pnl = (state.realized?.net || 0);
+
+    // re-derive tier base/ceil safely
+    const tb = getTierBase(state.balance);
+    state.tierBase = tb;
+    state.tierCeil = getTierCeil(tb);
+
     return true;
   } catch {
     return false;
@@ -215,13 +282,14 @@ function loadNow() {
 }
 loadNow();
 
-// ---------- SIGNALS ----------
+// ---- Learning buffer ----
 function pushBuf(symbol, price) {
   if (!state.buf[symbol]) state.buf[symbol] = [];
   const b = state.buf[symbol];
   b.push(price);
   while (b.length > 60) b.shift();
 }
+
 function computeSignals(symbol) {
   const b = state.buf[symbol] || [];
   if (b.length < 10) return { vol: 0, edge: 0, conf: 0, reason: "collecting_more_data" };
@@ -236,112 +304,118 @@ function computeSignals(symbol) {
   const late = mean(b.slice(Math.floor((2 * b.length) / 3)));
   const edge = (late - early) / (early || 1);
 
-  const ticksFactor = clamp(state.learnStats.ticksSeen / state.config.WARMUP_TICKS, 0, 1);
-  const trendFactor = clamp(Math.abs(edge) / (state.config.MIN_EDGE * 2), 0, 1);
+  const ticksFactor = clamp(state.learnStats.ticksSeen / WARMUP_TICKS, 0, 1);
+  const trendFactor = clamp(Math.abs(edge) / (MIN_EDGE * 2), 0, 1);
   const noisePenalty = 1 - volNorm * 0.7;
 
   const conf =
     clamp(ticksFactor * 0.55 + trendFactor * 0.55, 0, 1) * clamp(noisePenalty, 0.2, 1);
 
   let reason = "warmup";
-  if (state.learnStats.ticksSeen >= state.config.WARMUP_TICKS && Math.abs(edge) < state.config.MIN_EDGE) reason = "trend_unclear";
-  else if (state.learnStats.ticksSeen >= state.config.WARMUP_TICKS && volNorm > 0.85) reason = "too_noisy";
-  else if (state.learnStats.ticksSeen >= state.config.WARMUP_TICKS) reason = "edge_detected";
+  if (state.learnStats.ticksSeen >= WARMUP_TICKS && Math.abs(edge) < MIN_EDGE) reason = "trend_unclear";
+  else if (state.learnStats.ticksSeen >= WARMUP_TICKS && volNorm > 0.85) reason = "too_noisy";
+  else if (state.learnStats.ticksSeen >= WARMUP_TICKS) reason = "edge_detected";
 
   return { vol: volNorm, edge, conf, reason };
 }
 
-// ---------- COST MODEL ----------
-function entryCostRate() {
-  const spreadPct = state.config.SPREAD_BP / 10000;
-  const slipPct = state.config.SLIPPAGE_BP / 10000;
-  return state.config.FEE_RATE + spreadPct + slipPct;
-}
-function totalRoundTripCostRate() {
-  const spreadPct = state.config.SPREAD_BP / 10000;
-  const slipPct = state.config.SLIPPAGE_BP / 10000;
-  return (2 * state.config.FEE_RATE) + spreadPct + slipPct;
-}
-function applyEntryCosts(usdNotional) {
-  const spreadPct = state.config.SPREAD_BP / 10000;
-  const slipPct = state.config.SLIPPAGE_BP / 10000;
-  const fee = usdNotional * state.config.FEE_RATE;
-
-  const spreadCost = usdNotional * spreadPct;
-  const slippageCost = usdNotional * slipPct;
-
-  state.costs.feePaid += fee;
-  state.costs.spreadCost += spreadCost;
-  state.costs.slippageCost += slippageCost;
-
-  return fee + spreadCost + slippageCost;
-}
-function applyExitFee(usdNotional) {
-  const fee = usdNotional * state.config.FEE_RATE;
-  state.costs.feePaid += fee;
-  return fee;
-}
-
-// ---------- DAILY CHECK ----------
+// ---- Limits ----
 function checkDaily(ts) {
   const dk = dayKey(ts);
-
   if (state.limits.dayKey !== dk) {
     state.limits.dayKey = dk;
     state.limits.tradesToday = 0;
-  }
-
-  if (state.daily.dayKey !== dk) {
-    state.daily.dayKey = dk;
-    state.daily.lossesToday = 0;
-    state.daily.recoveryMode = false;
-    state.daily.recoveryDebtUsd = 0;
-    state.daily.recoveryDebtStartUsd = 0;
+    state.limits.lossStreak = 0;
   }
 }
 
 function checkDrawdown() {
-  const peak = state.startBalance;
-  const dd = (peak - state.wallets.trading) / peak;
-  if (dd >= state.config.MAX_DRAWDOWN_PCT) {
+  const peak = Math.max(state.startBalance, state.tierBase); // simple guard
+  const dd = (peak - state.balance) / peak;
+  if (dd >= MAX_DRAWDOWN_PCT) {
     state.limits.halted = true;
-    state.limits.haltReason = `max_drawdown_${Math.round(state.config.MAX_DRAWDOWN_PCT * 100)}%`;
+    state.limits.haltReason = `max_drawdown_${Math.round(MAX_DRAWDOWN_PCT * 100)}%`;
   }
 }
 
-// ---------- RISK % LOGIC (MANUAL OVERRIDE + DAILY RECOVERY MODE) ----------
-function currentRiskPct() {
-  // Owner override wins over everything
-  const manual = state.config.MANUAL_RISK_PCT;
-  if (manual !== null && manual !== undefined && Number.isFinite(Number(manual))) {
-    return clamp(Number(manual), 0.005, state.config.MAX_RISK_PCT);
+// ---- Storehouse + tier updates ----
+function enforceWalletCapAndOverflow() {
+  if (state.balance > MAX_TRADING_WALLET) {
+    const overflow = state.balance - MAX_TRADING_WALLET;
+    state.balance = MAX_TRADING_WALLET;
+    state.storehouse += overflow;
+
+    state.trades.push({
+      time: Date.now(),
+      symbol: "SYSTEM",
+      type: "STOREHOUSE_CREDIT",
+      price: 0,
+      qty: 0,
+      usd: overflow,
+      note: "overflow_to_storehouse"
+    });
   }
-
-  // Recovery mode: start at 3% and climb to max as debt is repaid
-  if (state.daily.recoveryMode) {
-    const base = clamp(state.config.RECOVERY_BASE_RISK_PCT, 0.005, state.config.MAX_RISK_PCT);
-    const max = state.config.MAX_RISK_PCT;
-
-    const startDebt = Math.max(1e-9, Number(state.daily.recoveryDebtStartUsd || 0));
-    const debtNow = Math.max(0, Number(state.daily.recoveryDebtUsd || 0));
-
-    // progress = 0 when debt unchanged, 1 when fully repaid
-    const progress = clamp((startDebt - debtNow) / startDebt, 0, 1);
-
-    return clamp(base + progress * (max - base), base, max);
-  }
-
-  // Normal mode: use your base->max logic (simple)
-  return clamp(state.config.BASE_RISK_PCT, 0.005, state.config.MAX_RISK_PCT);
 }
 
-// ---------- TRADE PROFITABILITY CHECK ----------
-function canTradeProfitablyAtTP() {
-  const rt = totalRoundTripCostRate();
-  return state.config.TAKE_PROFIT_PCT > rt;
+function updateTierAndRisk() {
+  const tb = getTierBase(state.balance);
+  const tc = getTierCeil(tb);
+
+  // If tier changed (up or down), risk floor resets to 3% (your rule)
+  const tierChanged = tb !== state.tierBase;
+  state.tierBase = tb;
+  state.tierCeil = tc;
+
+  if (tierChanged) {
+    state.riskPctFloor = BASE_RISK_PCT;
+    state.limits.lossStreak = 0;
+  }
+
+  // Compute current risk % inside tier
+  state.riskPctNow = currentRiskPct(state.balance, state.tierBase, state.riskPctFloor);
+  state.learnStats.riskPctNow = state.riskPctNow;
 }
 
-// ---------- TRADING ----------
+function maybeTopUpFromStorehouse(ts) {
+  // Trigger when trading wallet falls to 50% of current tier base (ex: 100k tier -> trigger under 50k)
+  const triggerLevel = state.tierBase * TOPUP_TRIGGER_PCT;
+
+  if (state.balance >= triggerLevel) return;
+
+  const needed = state.tierBase - state.balance;
+  if (needed <= 0) return;
+
+  const available = state.storehouse;
+
+  const transfer = Math.max(0, Math.min(needed, available));
+  if (transfer > 0) {
+    state.storehouse -= transfer;
+    state.balance += transfer;
+
+    state.trades.push({
+      time: ts,
+      symbol: "SYSTEM",
+      type: "STOREHOUSE_TOPUP",
+      price: 0,
+      qty: 0,
+      usd: transfer,
+      note: `topup_to_tier_base_${state.tierBase}`
+    });
+  } else {
+    // Storehouse empty: record it (so you SEE why topup didn’t happen)
+    state.trades.push({
+      time: ts,
+      symbol: "SYSTEM",
+      type: "STOREHOUSE_TOPUP_FAILED",
+      price: 0,
+      qty: 0,
+      usd: needed,
+      note: "storehouse_empty"
+    });
+  }
+}
+
+// ---- Trading logic ----
 function maybeEnter(symbol, price, ts) {
   const { vol, edge, conf, reason } = computeSignals(symbol);
 
@@ -357,25 +431,17 @@ function maybeEnter(symbol, price, ts) {
   }
 
   if (state.position) { state.learnStats.decision = "WAIT"; return; }
-  if (state.learnStats.ticksSeen < state.config.WARMUP_TICKS) { state.learnStats.decision = "WAIT"; return; }
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) { state.learnStats.decision = "WAIT"; return; }
 
-  if (Date.now() - (state.limits.lastTradeTs || 0) < state.config.COOLDOWN_MS) {
+  if (Date.now() - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "cooldown";
     return;
   }
 
-  if (state.limits.tradesToday >= state.config.MAX_TRADES_PER_DAY) {
+  if (state.limits.tradesToday >= MAX_TRADES_PER_DAY) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "max_trades_today";
-    return;
-  }
-
-  if (!canTradeProfitablyAtTP()) {
-    state.limits.halted = true;
-    state.limits.haltReason = "tp_too_small_for_fees";
-    state.learnStats.decision = "WAIT";
-    state.learnStats.lastReason = "tp_too_small_for_fees";
     return;
   }
 
@@ -385,45 +451,32 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  if (Math.abs(edge) < state.config.MIN_EDGE) {
+  if (Math.abs(edge) < MIN_EDGE) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "trend_below_threshold";
     return;
   }
 
-  // size by % of trading wallet
-  const pct = currentRiskPct();
-  let usdNotional = state.wallets.trading * pct;
+  // ---- Position sizing: tiered risk % ----
+  updateTierAndRisk();
 
-  // enforce min/max sizing
-  usdNotional = Math.max(usdNotional, state.config.MIN_USD_PER_TRADE);
-  usdNotional = Math.min(usdNotional, state.config.MAX_USD_PER_TRADE);
+  // Notional target = balance * riskPctNow, scaled and clamped
+  let usdNotional = state.balance * state.riskPctNow * RISK_SCALE;
 
-  // expected net at TP must be meaningful
-  const rt = totalRoundTripCostRate();
-  const netPerUsdAtTP = state.config.TAKE_PROFIT_PCT - rt;
-  const expectedNetAtTP = usdNotional * Math.max(0, netPerUsdAtTP);
-  if (expectedNetAtTP < state.config.MIN_NET_TP_USD) {
-    state.learnStats.decision = "WAIT";
-    state.learnStats.lastReason = "trade_too_small_for_net_tp";
-    return;
-  }
+  // Fee dominance protection: enforce MIN_TRADE_USD
+  usdNotional = clamp(usdNotional, MIN_TRADE_USD, MAX_TRADE_USD);
 
-  // must afford entry costs
-  const worstEntryCosts = usdNotional * entryCostRate();
-  if (state.wallets.trading <= worstEntryCosts + 1) {
-    state.learnStats.decision = "WAIT";
-    state.learnStats.lastReason = "wallet_too_low_for_fees";
-    return;
-  }
+  // Also never exceed available cash too much (keep buffer)
+  usdNotional = Math.min(usdNotional, Math.max(MIN_TRADE_USD, state.balance * 0.25));
 
   const qty = usdNotional / price;
 
-  const entryCosts = applyEntryCosts(usdNotional);
-  state.wallets.trading -= entryCosts;
+  const entryCosts = applyEntryCosts(state, usdNotional);
+  state.balance -= entryCosts;
 
   state.position = {
     symbol,
+    side: "LONG",
     qty,
     entry: price,
     entryTs: ts,
@@ -439,88 +492,54 @@ function maybeEnter(symbol, price, ts) {
     qty,
     usd: usdNotional,
     cost: entryCosts,
-    note: state.daily.recoveryMode ? "entry_recovery_mode" : "entry_normal_mode"
+    note: "paper_entry"
   });
 
   state.limits.lastTradeTs = ts;
   state.limits.tradesToday += 1;
 
   state.learnStats.decision = "BUY";
-  state.learnStats.lastReason = "entered_long";
-}
-
-function onClosedTrade(net) {
-  // net < 0 => loss
-  if (net < 0) {
-    state.daily.lossesToday += 1;
-
-    // if we hit the daily loss reset count, enter recovery mode
-    if (state.daily.lossesToday >= state.config.DAILY_LOSS_RESET_COUNT) {
-      // add this loss into debt pool (debt is positive)
-      const addDebt = Math.abs(net);
-
-      // if first time entering recovery today, set start debt snapshot
-      if (!state.daily.recoveryMode) {
-        state.daily.recoveryMode = true;
-        state.daily.recoveryDebtUsd = addDebt;
-        state.daily.recoveryDebtStartUsd = addDebt;
-      } else {
-        // already in recovery, just increase debt (and start debt too so progress remains consistent)
-        state.daily.recoveryDebtUsd += addDebt;
-        state.daily.recoveryDebtStartUsd += addDebt;
-      }
-    } else {
-      // not yet in recovery, do nothing special
-    }
-  } else if (net > 0) {
-    // win: if in recovery, pay down debt
-    if (state.daily.recoveryMode) {
-      state.daily.recoveryDebtUsd -= net;
-
-      if (state.daily.recoveryDebtUsd <= 0) {
-        // debt fully repaid -> exit recovery mode (but lossesToday stays counted for the day)
-        state.daily.recoveryMode = false;
-        state.daily.recoveryDebtUsd = 0;
-        state.daily.recoveryDebtStartUsd = 0;
-      }
-    }
-  }
+  state.learnStats.lastReason = `entered_long_risk_${Math.round(state.riskPctNow * 100)}%`;
 }
 
 function maybeExit(symbol, price, ts) {
   const pos = state.position;
   if (!pos) return;
 
-  // critical: prevent cross-symbol exits
+  // ✅ FIX: never exit a BTC position using an ETH tick (or vice versa)
   if (pos.symbol !== symbol) return;
 
   const entry = pos.entry;
   const change = (price - entry) / entry;
 
-  if (change >= state.config.TAKE_PROFIT_PCT || change <= -state.config.STOP_LOSS_PCT) {
+  if (change >= TAKE_PROFIT_PCT || change <= -STOP_LOSS_PCT) {
     const exitNotionalUsd = pos.qty * price;
     const gross = (price - entry) * pos.qty;
 
-    const exitFee = applyExitFee(exitNotionalUsd);
+    const exitFee = applyExitFee(state, exitNotionalUsd);
     const net = gross - (pos.entryCosts || 0) - exitFee;
 
-    // apply P&L to trading wallet
-    state.wallets.trading += net;
-
-    // record totals
+    // Apply net change to trading wallet
+    state.balance += net;
     state.realized.net += net;
     state.pnl = state.realized.net;
 
+    // Win/loss tracking + loss streak
     if (net >= 0) {
       state.realized.wins += 1;
       state.realized.grossProfit += net;
+      state.limits.lossStreak = 0;
     } else {
       state.realized.losses += 1;
-      state.realized.grossLoss += net;
-    }
+      state.realized.grossLoss += net; // negative
+      state.limits.lossStreak = (state.limits.lossStreak || 0) + 1;
 
-    // NEW: daily recovery logic
-    onClosedTrade(net);
+      // If 3 losses, snap risk floor back to 3% (your rule)
+      if (state.limits.lossStreak >= (state.limits.lossStreakTrigger || 3)) {
+        state.riskPctFloor = BASE_RISK_PCT;
+        state.learnStats.lastReason = "loss_streak_3_reset_to_3%";
+      }
+    }
 
     state.trades.push({
       time: ts,
@@ -532,20 +551,32 @@ function maybeExit(symbol, price, ts) {
       profit: net,
       gross,
       fees: exitFee,
-      note: change >= state.config.TAKE_PROFIT_PCT ? "take_profit" : "stop_loss"
+      note: change >= TAKE_PROFIT_PCT ? "take_profit" : "stop_loss"
     });
 
     state.position = null;
 
+    // Wallet cap + overflow to storehouse
+    enforceWalletCapAndOverflow();
+
+    // Update tier/risk after wallet changes
+    updateTierAndRisk();
+
+    // If wallet dropped too hard, top-up from storehouse to tier base (if available)
+    maybeTopUpFromStorehouse(ts);
+
+    // Re-evaluate tier after topup
+    updateTierAndRisk();
+
     checkDrawdown();
 
     state.learnStats.decision = "SELL";
-    state.learnStats.lastReason = change >= state.config.TAKE_PROFIT_PCT ? "tp_hit" : "sl_hit";
   } else {
     state.learnStats.decision = "WAIT";
   }
 }
 
+// supports tick(price) or tick(symbol, price, ts)
 function tick(a, b, c) {
   if (!state.running) return;
 
@@ -570,11 +601,11 @@ function tick(a, b, c) {
 
   pushBuf(symbol, price);
 
-  // exit before enter
+  // Exit before enter
   maybeExit(symbol, price, ts);
   maybeEnter(symbol, price, ts);
 
-  if (state.trades.length > 4000) state.trades = state.trades.slice(-1500);
+  if (state.trades.length > 6000) state.trades = state.trades.slice(-2000);
 
   scheduleSave();
 }
@@ -590,33 +621,23 @@ function hardReset() {
   saveNow();
 }
 
-// config update (optional)
-function updateConfig(patch = {}) {
-  state.config = { ...state.config, ...patch };
-
-  state.config.RECOVERY_BASE_RISK_PCT = clamp(Number(state.config.RECOVERY_BASE_RISK_PCT || 0.03), 0.005, 0.95);
-  state.config.BASE_RISK_PCT = clamp(Number(state.config.BASE_RISK_PCT || 0.12), 0.005, 0.95);
-  state.config.MAX_RISK_PCT = clamp(Number(state.config.MAX_RISK_PCT || 0.5), state.config.BASE_RISK_PCT, 0.95);
-
-  if (state.config.MANUAL_RISK_PCT === "" || state.config.MANUAL_RISK_PCT === undefined) {
-    state.config.MANUAL_RISK_PCT = null;
-  }
-  if (state.config.MANUAL_RISK_PCT !== null) {
-    const v = Number(state.config.MANUAL_RISK_PCT);
-    state.config.MANUAL_RISK_PCT = Number.isFinite(v) ? clamp(v, 0.005, state.config.MAX_RISK_PCT) : null;
-  }
-
-  state.config.DAILY_LOSS_RESET_COUNT = Math.max(1, Number(state.config.DAILY_LOSS_RESET_COUNT || 2));
-  state.config.MAX_TRADES_PER_DAY = Math.max(1, Number(state.config.MAX_TRADES_PER_DAY || MAX_TRADES_PER_DAY_DEFAULT));
-
-  scheduleSave();
-  return state.config;
-}
-
 function snapshot() {
+  // keep tier/risk fresh in UI
+  updateTierAndRisk();
+
   return {
     running: state.running,
-    wallets: state.wallets,
+
+    // wallets
+    balance: state.balance,
+    storehouse: state.storehouse,
+
+    // tier + risk
+    tierBase: state.tierBase,
+    tierCeil: state.tierCeil,
+    riskPctFloor: state.riskPctFloor,
+    riskPctNow: state.riskPctNow,
+
     pnl: state.pnl,
     realized: state.realized,
     costs: state.costs,
@@ -625,10 +646,8 @@ function snapshot() {
     lastPriceBySymbol: state.lastPriceBySymbol,
     learnStats: state.learnStats,
     limits: state.limits,
-    daily: state.daily,
-    config: state.config,
-    riskPctNow: currentRiskPct()
+    config: state.config
   };
 }
 
-module.exports = { start, tick, snapshot, hardReset, updateConfig };
+module.exports = { start, tick, snapshot, hardReset };

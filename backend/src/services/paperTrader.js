@@ -5,14 +5,11 @@
 // - Full trade history (BUY + SELL)
 // - Loss control: after 2 losses/day → reset to baseline
 // - Owner-configurable sizing + trades/day
-// - Safe persistence
+// - Daily rollover reset (tradesToday/lossesToday/forceBaseline)
+// - Snapshot includes sizing info
 
 const fs = require('fs');
 const path = require('path');
-
-/* =========================
-   CONFIG / DEFAULTS
-========================= */
 
 const START_BAL = Number(process.env.PAPER_START_BALANCE || 100000);
 const WARMUP_TICKS = Number(process.env.PAPER_WARMUP_TICKS || 250);
@@ -23,26 +20,20 @@ const SLIPPAGE_BP = Number(process.env.PAPER_SLIPPAGE_BP || 8);
 const SPREAD_BP = Number(process.env.PAPER_SPREAD_BP || 6);
 const COOLDOWN_MS = Number(process.env.PAPER_COOLDOWN_MS || 12000);
 
-const BASELINE_PCT = Number(process.env.PAPER_BASELINE_PCT || 0.03); // 3%
-const MAX_PCT = Number(process.env.PAPER_OWNER_MAX_PCT || 0.50);     // 50%
+const BASELINE_PCT = Number(process.env.PAPER_BASELINE_PCT || 0.03);
+const MAX_PCT = Number(process.env.PAPER_OWNER_MAX_PCT || 0.50);
 const MAX_TRADES_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
 
 const TIER_SIZE = Number(process.env.PAPER_TIER_SIZE || 100000);
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-const STATE_FILE =
-  process.env.PAPER_STATE_PATH ||
-  path.join('/tmp', 'paper_state.json');
-
-/* =========================
-   STRATEGIES
-========================= */
+const STATE_FILE = process.env.PAPER_STATE_PATH || path.join('/tmp', 'paper_state.json');
 
 const SCALP = {
   name: 'SCALP',
   TP: 0.0025,
   SL: 0.0020,
-  HOLD_MS: 5000,
+  HOLD_MS: Number(process.env.PAPER_SCALP_HOLD_MS || 5000),
   MIN_CONF: 0.62,
 };
 
@@ -50,24 +41,19 @@ const LONG = {
   name: 'LONG',
   TP: 0.010,
   SL: 0.006,
-  HOLD_MS: 45 * 60 * 1000,
+  HOLD_MS: Number(process.env.PAPER_LONG_HOLD_MS || 45 * 60 * 1000),
   MIN_CONF: 0.80,
 };
-
-/* =========================
-   UTIL
-========================= */
 
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 
 function dayKey(ts) {
   const d = new Date(ts);
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
 }
-
-/* =========================
-   STATE
-========================= */
 
 function defaultState() {
   return {
@@ -106,13 +92,13 @@ function defaultState() {
     },
 
     limits: {
+      dayKey: dayKey(Date.now()),
       tradesToday: 0,
       lossesToday: 0,
       forceBaseline: false,
       lastTradeTs: 0,
       halted: false,
       haltReason: null,
-      dayKey: dayKey(Date.now()),
     },
 
     owner: {
@@ -127,16 +113,10 @@ function defaultState() {
 
 let state = defaultState();
 
-/* =========================
-   PERSISTENCE
-========================= */
-
+/* ========== persistence ========== */
 function save() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch {}
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch {}
 }
-
 function load() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -145,13 +125,30 @@ function load() {
     }
   } catch {}
 }
-
 load();
 
-/* =========================
-   SIGNALS
-========================= */
+/* ========== daily rollover ========== */
+function checkDaily(ts) {
+  const dk = dayKey(ts);
+  if (state.limits.dayKey !== dk) {
+    state.limits.dayKey = dk;
+    state.limits.tradesToday = 0;
+    state.limits.lossesToday = 0;
+    state.limits.forceBaseline = false;
+  }
+}
 
+/* ========== drawdown safety ========== */
+function checkDrawdown() {
+  const peak = state.startBalance;
+  const dd = (peak - state.equity) / peak;
+  if (dd >= MAX_DRAWDOWN_PCT) {
+    state.limits.halted = true;
+    state.limits.haltReason = `max_drawdown_${Math.round(MAX_DRAWDOWN_PCT * 100)}%`;
+  }
+}
+
+/* ========== signals ========== */
 function pushBuf(sym, price) {
   const b = state.buf[sym] || [];
   b.push(price);
@@ -163,37 +160,39 @@ function computeSignals(sym) {
   const b = state.buf[sym] || [];
   if (b.length < 15) return { conf: 0, edge: 0, reason: 'warming_up' };
 
-  const early = b.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
-  const late = b.slice(-20).reduce((a, b) => a + b, 0) / 20;
-  const edge = (late - early) / early;
+  const early = b.slice(0, 20).reduce((a, x) => a + x, 0) / 20;
+  const late = b.slice(-20).reduce((a, x) => a + x, 0) / 20;
+  const edge = (late - early) / (early || 1);
 
   const conf = clamp(Math.abs(edge) / (MIN_EDGE * 2), 0, 1);
   return { conf, edge, reason: 'edge_detected' };
 }
 
-/* =========================
-   SIZING
-========================= */
-
+/* ========== sizing ========== */
 function tierBase() {
-  return Math.max(TIER_SIZE, Math.floor(state.equity / TIER_SIZE) * TIER_SIZE);
+  return Math.max(TIER_SIZE, Math.floor((state.equity || 0) / TIER_SIZE) * TIER_SIZE);
 }
 
 function sizePct() {
-  if (state.limits.forceBaseline) return state.owner.baselinePct;
-  return clamp(state.owner.maxPct, state.owner.baselinePct, state.owner.maxPct);
+  const baseline = clamp(Number(state.owner.baselinePct || BASELINE_PCT), 0.001, 0.50);
+  const maxPct = clamp(Number(state.owner.maxPct || MAX_PCT), baseline, 0.50);
+  if (state.limits.forceBaseline) return baseline;
+
+  // Smooth grow within tier: baseline → maxPct as equity approaches tier top
+  const base = tierBase();
+  const top = base + TIER_SIZE;
+  const p = clamp(((state.equity || 0) - base) / (top - base), 0, 1);
+
+  return clamp(baseline + p * (maxPct - baseline), baseline, maxPct);
 }
 
 function tradeSizeUsd() {
   let usd = tierBase() * sizePct();
-  usd = Math.min(usd, state.cashBalance - 1);
+  usd = Math.min(usd, Math.max(0, (state.cashBalance || 0) - 1));
   return Math.max(25, usd);
 }
 
-/* =========================
-   COSTS
-========================= */
-
+/* ========== costs ========== */
 function entryCost(usd) {
   const fee = usd * FEE_RATE;
   const slip = usd * (SLIPPAGE_BP / 10000);
@@ -203,21 +202,20 @@ function entryCost(usd) {
   state.costs.spreadCost += spread;
   return fee + slip + spread;
 }
-
 function exitFee(usd) {
   const fee = usd * FEE_RATE;
   state.costs.feePaid += fee;
   return fee;
 }
 
-/* =========================
-   TRADING LOGIC
-========================= */
-
+/* ========== trading ========== */
 function maybeEnter(sym, price, ts) {
+  if (state.limits.halted) return;
   if (state.position) return;
   if (state.learnStats.ticksSeen < WARMUP_TICKS) return;
-  if (state.limits.tradesToday >= state.owner.maxTradesPerDay) return;
+
+  if (Date.now() - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) return;
+  if (state.limits.tradesToday >= Number(state.owner.maxTradesPerDay || MAX_TRADES_DAY)) return;
 
   const { conf, edge, reason } = computeSignals(sym);
   state.learnStats.confidence = conf;
@@ -236,7 +234,7 @@ function maybeEnter(sym, price, ts) {
   if (state.cashBalance < usd + cost) return;
 
   const qty = usd / price;
-  state.cashBalance -= usd + cost;
+  state.cashBalance -= (usd + cost);
 
   state.position = {
     symbol: sym,
@@ -258,10 +256,13 @@ function maybeEnter(sym, price, ts) {
     strategy: strat.name,
     price,
     usd,
-    note: `Entered ${strat.name} with ${(sizePct() * 100).toFixed(1)}%`,
+    cost,
+    holdMs: strat.HOLD_MS,
+    note: `Entered ${strat.name} • size ${(sizePct() * 100).toFixed(1)}% of tier ${tierBase()}`,
   });
 
   state.limits.tradesToday++;
+  state.limits.lastTradeTs = ts;
 }
 
 function maybeExit(sym, price, ts) {
@@ -273,15 +274,23 @@ function maybeExit(sym, price, ts) {
   const hitSL = change <= -p.sl;
   const expired = ts >= p.expiresAt;
 
-  if (!hitTP && !hitSL && !expired) return;
+  if (!hitTP && !hitSL && !expired) {
+    // mark equity with unrealized
+    state.equity = state.cashBalance + (price - p.entry) * p.qty;
+    return;
+  }
 
   const gross = (price - p.entry) * p.qty;
   const fee = exitFee(p.qty * price);
   const net = gross - p.cost - fee;
 
-  state.cashBalance += p.usd + net;
+  state.cashBalance += (p.usd + net);
   state.equity = state.cashBalance;
+
   state.realized.net += net;
+  state.pnl = state.realized.net;
+
+  const heldMs = Math.max(0, ts - (p.entryTs || ts));
 
   if (net >= 0) {
     state.realized.wins++;
@@ -298,49 +307,73 @@ function maybeExit(sym, price, ts) {
     time: ts,
     type: 'SELL',
     symbol: sym,
+    strategy: p.strategy,
     price,
+    usd: p.qty * price,
     profit: net,
+    holdMs: heldMs,
     exitReason: hitTP ? 'take_profit' : hitSL ? 'stop_loss' : 'expiry',
   });
 
   state.position = null;
+  checkDrawdown();
 }
 
-/* =========================
-   TICK
-========================= */
-
+/* ========== public API ========== */
 function tick(sym, price, ts = Date.now()) {
+  if (!state.running) return;
+
+  checkDaily(ts);
+
   state.learnStats.ticksSeen++;
   state.learnStats.lastTickTs = ts;
   state.lastPriceBySymbol[sym] = price;
 
   pushBuf(sym, price);
+
   maybeExit(sym, price, ts);
   maybeEnter(sym, price, ts);
 
+  if (state.trades.length > 6000) state.trades = state.trades.slice(-2000);
+
   save();
 }
-
-/* =========================
-   API
-========================= */
 
 function snapshot() {
-  return { ...state };
+  const pos = state.position;
+  const lastPx = pos ? state.lastPriceBySymbol[pos.symbol] : null;
+  const unreal = (pos && Number.isFinite(lastPx)) ? (Number(lastPx) - pos.entry) * pos.qty : 0;
+
+  const now = Date.now();
+  const ageMs = pos ? Math.max(0, now - (pos.entryTs || now)) : null;
+  const remainingMs = pos ? Math.max(0, (pos.expiresAt || now) - now) : null;
+
+  return {
+    ...state,
+    unrealizedPnL: unreal,
+    position: pos ? { ...pos, ageMs, remainingMs, holdMs: (pos.expiresAt - pos.entryTs) } : null,
+    sizing: {
+      tierBase: tierBase(),
+      sizePct: sizePct(),
+      sizeUsd: tradeSizeUsd(),
+    },
+  };
 }
 
-function start() {
-  state.running = true;
-}
+function start() { state.running = true; }
+function hardReset() { state = defaultState(); save(); }
 
-function hardReset() {
-  state = defaultState();
-  save();
-}
+function setConfig(patch = {}) {
+  const o = state.owner || {};
+  if (patch.baselinePct != null) o.baselinePct = Number(patch.baselinePct);
+  if (patch.maxPct != null) o.maxPct = Number(patch.maxPct);
+  if (patch.maxTradesPerDay != null) o.maxTradesPerDay = Number(patch.maxTradesPerDay);
 
-function setConfig(patch) {
-  state.owner = { ...state.owner, ...patch };
+  o.baselinePct = clamp(Number(o.baselinePct || BASELINE_PCT), 0.001, 0.50);
+  o.maxPct = clamp(Number(o.maxPct || MAX_PCT), o.baselinePct, 0.50);
+  o.maxTradesPerDay = clamp(Number(o.maxTradesPerDay || MAX_TRADES_DAY), 1, 500);
+
+  state.owner = o;
   save();
   return state.owner;
 }

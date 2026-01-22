@@ -4,8 +4,11 @@
 // - equity includes unrealized PnL when a position is open
 // - prevents cross-symbol exits (no random huge jumps)
 // - persistence safe for Render Disk (/var/data) or /tmp fallback
-// - adds strategy profiles: SCALP (quick) vs LONG (conviction)
-// - adds time-based expiry (shows countdown + can auto-exit on expiry)
+// - strategy profiles: SCALP (quick) vs LONG (conviction)
+// - time-based expiry (shows countdown + can auto-exit on expiry)
+// ✅ FIX: fee-aware entry gate (prevents “fees dominate -> endless tiny losses”)
+// ✅ FIX: scalps require stronger edge + higher TP than costs
+// ✅ FIX: optional loss-streak cooldown (stops revenge-trading)
 
 const fs = require('fs');
 const path = require('path');
@@ -28,23 +31,33 @@ const MIN_USD_PER_TRADE = Number(process.env.PAPER_MIN_USD_PER_TRADE || 25);
 const MAX_TRADES_PER_DAY = Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40);
 const MAX_DRAWDOWN_PCT = Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25);
 
-// Strategy profiles (you can tweak later with env vars if you want)
+// ✅ fee-aware gating (prevents scalp death by fees)
+const MIN_EXPECTED_NET_USD = Number(process.env.PAPER_MIN_EXPECTED_NET_USD || 0.75); // require at least this much *net* potential
+const COST_BUFFER_MULT = Number(process.env.PAPER_COST_BUFFER_MULT || 1.25);         // TP must beat costs by this factor
+
+// ✅ loss-streak cooldown (optional)
+const LOSS_STREAK_COOLDOWN_MS = Number(process.env.PAPER_LOSS_STREAK_COOLDOWN_MS || 60000); // 60s
+const MAX_CONSEC_LOSSES_BEFORE_COOLDOWN = Number(process.env.PAPER_MAX_CONSEC_LOSSES || 2);
+
+// Strategy profiles
+// NOTE: if you set PAPER_SCALP_HOLD_MS=5000 (5s), you will almost always lose with these fees.
+// The fee-gate below will BLOCK those trades unless they can realistically beat costs.
 const SCALP = {
   name: "SCALP",
-  // quick trades: tighter TP/SL, forced expiry
-  TP: Number(process.env.PAPER_SCALP_TP_PCT || 0.0025),   // 0.25%
-  SL: Number(process.env.PAPER_SCALP_SL_PCT || 0.0020),   // 0.20%
-  HOLD_MS: Number(process.env.PAPER_SCALP_HOLD_MS || 45000), // 45s
-  MIN_CONF: Number(process.env.PAPER_SCALP_MIN_CONF || 0.62),
+  TP: Number(process.env.PAPER_SCALP_TP_PCT || 0.0040),          // 0.40% (raised so it can outrun fees)
+  SL: Number(process.env.PAPER_SCALP_SL_PCT || 0.0030),          // 0.30%
+  HOLD_MS: Number(process.env.PAPER_SCALP_HOLD_MS || 60000),     // 60s default (NOT 5s)
+  MIN_CONF: Number(process.env.PAPER_SCALP_MIN_CONF || 0.70),    // stricter than before
+  MIN_EDGE_MULT: Number(process.env.PAPER_SCALP_MIN_EDGE_MULT || 2.0) // needs stronger edge
 };
 
 const LONG = {
   name: "LONG",
-  // longer trades: wider TP/SL, longer expiry
-  TP: Number(process.env.PAPER_LONG_TP_PCT || 0.010),     // 1.0%
-  SL: Number(process.env.PAPER_LONG_SL_PCT || 0.006),     // 0.60%
+  TP: Number(process.env.PAPER_LONG_TP_PCT || 0.012),            // 1.2%
+  SL: Number(process.env.PAPER_LONG_SL_PCT || 0.007),            // 0.7%
   HOLD_MS: Number(process.env.PAPER_LONG_HOLD_MS || 45 * 60 * 1000), // 45m
-  MIN_CONF: Number(process.env.PAPER_LONG_MIN_CONF || 0.80),
+  MIN_CONF: Number(process.env.PAPER_LONG_MIN_CONF || 0.82),
+  MIN_EDGE_MULT: Number(process.env.PAPER_LONG_MIN_EDGE_MULT || 2.5)
 };
 
 const STATE_FILE =
@@ -89,7 +102,8 @@ function defaultState() {
       losses: 0,
       grossProfit: 0,
       grossLoss: 0,
-      net: 0
+      net: 0,
+      consecLosses: 0 // ✅ track loss streak
     },
 
     costs: {
@@ -100,8 +114,8 @@ function defaultState() {
 
     trades: [],
 
-    // only ONE position for safety (keeps behavior "one after the other")
-    position: null, // {symbol, strategy, qty, entry, entryTs, expiresAt, holdMs, entryNotionalUsd, entryCosts}
+    // only ONE position
+    position: null, // {symbol, strategy, qty, entry, entryTs, expiresAt, holdMs, entryNotionalUsd, entryCosts, tpPct, slPct}
 
     lastPriceBySymbol: {},
 
@@ -120,7 +134,8 @@ function defaultState() {
       dayKey: dayKey(Date.now()),
       lastTradeTs: 0,
       halted: false,
-      haltReason: null
+      haltReason: null,
+      cooldownUntil: 0 // ✅ extra cooldown after loss streak
     },
 
     config: {
@@ -136,6 +151,10 @@ function defaultState() {
       MAX_USD_PER_TRADE,
       MAX_TRADES_PER_DAY,
       MAX_DRAWDOWN_PCT,
+      MIN_EXPECTED_NET_USD,
+      COST_BUFFER_MULT,
+      LOSS_STREAK_COOLDOWN_MS,
+      MAX_CONSEC_LOSSES_BEFORE_COOLDOWN,
       STATE_FILE,
       SCALP,
       LONG
@@ -194,6 +213,10 @@ function loadNow() {
     if (!Number.isFinite(Number(state.cashBalance))) state.cashBalance = state.balance ?? base.cashBalance;
     if (!Number.isFinite(Number(state.equity))) state.equity = state.cashBalance;
     if (!Number.isFinite(Number(state.startBalance))) state.startBalance = base.startBalance;
+
+    // backwards compat for consecLosses/cooldown
+    if (!Number.isFinite(Number(state.realized.consecLosses))) state.realized.consecLosses = 0;
+    if (!Number.isFinite(Number(state.limits.cooldownUntil))) state.limits.cooldownUntil = 0;
 
     const dk = dayKey(Date.now());
     if (state.limits.dayKey !== dk) {
@@ -269,12 +292,34 @@ function applyExitFee(usdNotional) {
   return fee;
 }
 
+// ✅ estimate “round trip” cost BEFORE entering (so we can block bad trades)
+function estimateRoundTripCosts(usdNotional) {
+  // entry side: fee + spread + slippage
+  const spreadPct = SPREAD_BP / 10000;
+  const slipPct = SLIPPAGE_BP / 10000;
+
+  const entryFee = usdNotional * FEE_RATE;
+  const entrySpread = usdNotional * spreadPct;
+  const entrySlip = usdNotional * slipPct;
+
+  // exit side: fee (we already model fee on exit; spread/slip is “effectively” in your fills too,
+  // but we’ll be conservative and count only fee on exit so we don't over-block.
+  const exitFee = usdNotional * FEE_RATE;
+
+  const entryCosts = entryFee + entrySpread + entrySlip;
+  const total = entryCosts + exitFee;
+
+  return { entryCosts, exitFee, total };
+}
+
 // ---- limits ----
 function checkDaily(ts) {
   const dk = dayKey(ts);
   if (state.limits.dayKey !== dk) {
     state.limits.dayKey = dk;
     state.limits.tradesToday = 0;
+    state.realized.consecLosses = 0;
+    state.limits.cooldownUntil = 0;
   }
 }
 
@@ -301,12 +346,12 @@ function updateEquity(symbol, price) {
 
 // ---- strategy selection ----
 function pickStrategy({ conf, edge, volNorm }) {
-  // LONG only when confidence is high and trend is strong and not too noisy
-  const strongTrend = Math.abs(edge) >= (MIN_EDGE * 2);
+  const strongTrendLong = Math.abs(edge) >= (MIN_EDGE * LONG.MIN_EDGE_MULT);
+  const strongTrendScalp = Math.abs(edge) >= (MIN_EDGE * SCALP.MIN_EDGE_MULT);
   const notCrazyNoisy = volNorm <= 0.85;
 
-  if (conf >= LONG.MIN_CONF && strongTrend && notCrazyNoisy) return LONG;
-  if (conf >= SCALP.MIN_CONF) return SCALP;
+  if (conf >= LONG.MIN_CONF && strongTrendLong && notCrazyNoisy) return LONG;
+  if (conf >= SCALP.MIN_CONF && strongTrendScalp && notCrazyNoisy) return SCALP;
   return null;
 }
 
@@ -325,10 +370,26 @@ function maybeEnter(symbol, price, ts) {
     return;
   }
 
-  if (state.position) { state.learnStats.decision = "WAIT"; state.learnStats.lastReason = "holding_position"; return; }
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) { state.learnStats.decision = "WAIT"; state.learnStats.lastReason = "warming_up"; return; }
+  if (state.position) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "holding_position";
+    return;
+  }
 
-  if (Date.now() - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) {
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "warming_up";
+    return;
+  }
+
+  const now = Date.now();
+  if (state.limits.cooldownUntil && now < state.limits.cooldownUntil) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = "loss_streak_cooldown";
+    return;
+  }
+
+  if (now - (state.limits.lastTradeTs || 0) < COOLDOWN_MS) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "cooldown";
     return;
@@ -361,6 +422,18 @@ function maybeEnter(symbol, price, ts) {
   if (usdNotional < MIN_USD_PER_TRADE) {
     state.learnStats.decision = "WAIT";
     state.learnStats.lastReason = "cash_too_low_for_min_trade";
+    return;
+  }
+
+  // ✅ fee-aware gate: block trades whose TP can't beat costs
+  // Expected gross profit at TP ~= usdNotional * TP%
+  const est = estimateRoundTripCosts(usdNotional);
+  const tpUsdGross = usdNotional * (strat.TP || 0);
+  const tpUsdNetApprox = tpUsdGross - est.total;
+
+  if (tpUsdGross < (est.total * COST_BUFFER_MULT) || tpUsdNetApprox < MIN_EXPECTED_NET_USD) {
+    state.learnStats.decision = "WAIT";
+    state.learnStats.lastReason = `tp_vs_costs_blocked_${strat.name.toLowerCase()}`;
     return;
   }
 
@@ -448,9 +521,16 @@ function maybeExit(symbol, price, ts) {
     if (net >= 0) {
       state.realized.wins += 1;
       state.realized.grossProfit += net;
+      state.realized.consecLosses = 0;
     } else {
       state.realized.losses += 1;
       state.realized.grossLoss += net;
+      state.realized.consecLosses = (state.realized.consecLosses || 0) + 1;
+
+      // ✅ cooldown after a loss streak
+      if (state.realized.consecLosses >= MAX_CONSEC_LOSSES_BEFORE_COOLDOWN) {
+        state.limits.cooldownUntil = Date.now() + LOSS_STREAK_COOLDOWN_MS;
+      }
     }
 
     const holdMs = Math.max(0, ts - (pos.entryTs || ts));

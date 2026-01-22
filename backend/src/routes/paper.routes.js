@@ -1,5 +1,5 @@
 // backend/src/routes/paper.routes.js
-// Paper endpoints: status + hard reset
+// Paper endpoints: status + hard reset + owner config
 // Safe: reset is locked behind an optional admin key (recommended)
 
 const express = require('express');
@@ -17,7 +17,7 @@ function resetAllowed(req) {
   return sent && sent === key;
 }
 
-// GET /api/paper/status  -> same as the old /api/paper/status you already call
+// GET /api/paper/status -> current paper snapshot (UI polls this)
 router.get('/status', (req, res) => {
   try {
     return res.json(paperTrader.snapshot());
@@ -41,6 +41,47 @@ router.post('/reset', (req, res) => {
       ok: true,
       message: 'Paper wallet reset complete.',
       stateFile: process.env.PAPER_STATE_PATH || '(default from paperTrader)',
+      snapshot: paperTrader.snapshot()
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// POST /api/paper/config -> owner controls for paper behavior (and later live too)
+// Body example:
+// {
+//   "baselinePct": 0.03,
+//   "maxPct": 0.50,
+//   "maxTradesPerDay": 40
+// }
+router.post('/config', (req, res) => {
+  try {
+    // Optional: protect config the same way as reset (recommended)
+    if (!resetAllowed(req)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Config blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY on backend).'
+      });
+    }
+
+    if (typeof paperTrader.setConfig !== 'function') {
+      return res.status(500).json({
+        ok: false,
+        error: 'paperTrader.setConfig is missing. Add setConfig() in services/paperTrader.js and export it.'
+      });
+    }
+
+    const patch = req.body || {};
+    const owner = paperTrader.setConfig({
+      baselinePct: patch.baselinePct,
+      maxPct: patch.maxPct,
+      maxTradesPerDay: patch.maxTradesPerDay
+    });
+
+    return res.json({
+      ok: true,
+      owner,
       snapshot: paperTrader.snapshot()
     });
   } catch (e) {

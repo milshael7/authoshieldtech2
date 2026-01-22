@@ -1,62 +1,28 @@
 // backend/src/routes/paper.routes.js
 const express = require('express');
 const router = express.Router();
+
 const paperTrader = require('../services/paperTrader');
 
-function resetAllowed(req) {
-  const key = String(process.env.PAPER_RESET_KEY || '').trim();
-  if (!key) return true;
-  const sent = String(req.headers['x-reset-key'] || '').trim();
-  return sent && sent === key;
-}
-
-// GET /api/paper/status
+// GET status
 router.get('/status', (req, res) => {
   try {
-    return res.json(paperTrader.snapshot());
+    res.json(paperTrader.snapshot());
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// POST /api/paper/reset
+// POST reset
 router.post('/reset', (req, res) => {
-  try {
-    if (!resetAllowed(req)) {
-      return res.status(403).json({
-        ok: false,
-        error: 'Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY).'
-      });
-    }
-    paperTrader.hardReset();
-    return res.json({ ok: true, message: 'Paper wallet reset complete.', snapshot: paperTrader.snapshot() });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+  paperTrader.hardReset();
+  res.json({ ok: true });
 });
 
-// ✅ NEW: owner config live update
-// POST /api/paper/config   body: { baselinePct, maxPct, maxTradesPerDay }
+// POST owner config
 router.post('/config', (req, res) => {
-  try {
-    if (!resetAllowed(req)) {
-      return res.status(403).json({
-        ok: false,
-        error: 'Config blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY).'
-      });
-    }
-
-    const patch = req.body || {};
-    const owner = paperTrader.setConfig({
-      baselinePct: patch.baselinePct,
-      maxPct: patch.maxPct,
-      maxTradesPerDay: patch.maxTradesPerDay
-    });
-
-    return res.json({ ok: true, owner, snapshot: paperTrader.snapshot() });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+  const cfg = paperTrader.setConfig(req.body || {});
+  res.json({ ok: true, owner: cfg });
 });
 
 module.exports = router;

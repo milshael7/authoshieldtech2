@@ -1,72 +1,93 @@
 // backend/src/services/posture.service.js
-// MVP posture calculator (safe defaults)
-// Later: wire to real DB/audit/incident metrics
+// Posture = the "security dashboard snapshot" for Individual / Company / Manager rooms.
+// Keep it simple + safe for MVP (no secrets, no raw logs dumped).
 
-function clamp(n, a, b) {
-  n = Number(n);
-  if (!Number.isFinite(n)) return a;
-  return Math.max(a, Math.min(b, n));
-}
+function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
 
-/**
- * Returns a stable posture payload you can display everywhere.
- * You can later replace this with real stats:
- * - audit events
- * - incident counts
- * - risk scoring
- * - company aggregation
- */
-function buildPosture({ scope = "me", actor = null } = {}) {
-  // If your auth middleware sets req.user, you can use it here.
-  const role = actor?.role || "User";
+function summarizeFromDbOrFallback({ userId, role }) {
+  // ✅ MVP: if you later have DB tables (events, alerts, cases), replace this with real queries.
+  // For now we return a stable, believable structure so UI can render consistently.
 
-  // Simple “starter scoring” (not finance-related, just UI posture)
-  // You will replace these with real metrics later.
-  const baseScore =
-    role === "Admin" ? 92 :
-    role === "Manager" ? 88 :
-    role === "Company" ? 84 :
-    80;
+  const now = Date.now();
 
-  // Coverage meters (0..100)
-  const coverage = {
-    phishing: 88,
-    malware: 76,
-    accountTakeover: 91,
-    fraud: 69
-  };
-
-  // Example “risk flags” that later become real alerts
-  const flags = [
-    { id: "mfa", title: "MFA", status: "recommended" },
-    { id: "password", title: "Password Policy", status: "ok" },
-    { id: "device", title: "Device Hygiene", status: "watch" },
-    { id: "training", title: "Staff Training", status: "watch" },
-  ];
-
-  // Build score from coverage (keep it deterministic)
-  const avg = (
-    coverage.phishing +
-    coverage.malware +
-    coverage.accountTakeover +
-    coverage.fraud
-  ) / 4;
-
-  const score = clamp(Math.round((baseScore * 0.55) + (avg * 0.45)), 0, 100);
+  // pretend-ish values so UI has data (replace later)
+  const baseUsers = 1;
+  const baseCompanies = role === 'Company' ? 1 : 0;
 
   return {
     ok: true,
-    scope,               // "me" | "company" | "manager"
-    role,                // from actor if available
-    score,               // 0..100
-    grade:
-      score >= 90 ? "Excellent" :
-      score >= 80 ? "Good" :
-      score >= 65 ? "Fair" : "At Risk",
-    coverage,            // meters
-    flags,               // checklist
-    updatedAt: new Date().toISOString()
+    at: now,
+
+    // who is asking
+    viewer: { userId, role },
+
+    // overall security posture (top KPIs)
+    posture: {
+      score: 82,                         // 0-100
+      risk: "medium",                    // low | medium | high
+      activeAlerts: 1,
+      openCases: 1,
+      blockedAttempts24h: 2,
+      phishingReports30d: 1,
+      malwareSignals30d: 0,
+      accountTakeoverSignals30d: 0
+    },
+
+    // “rooms” data
+    manager: {
+      users: baseUsers,
+      companies: baseCompanies,
+      auditEvents: 0,
+      notifications: 0
+    },
+
+    // optional lists (keep small for now)
+    recent: {
+      alerts: [
+        {
+          id: "al_1",
+          title: "Suspicious login pattern",
+          severity: "warn",
+          createdAt: now - 60 * 60 * 1000,
+          message: "Multiple login attempts detected from a new device fingerprint."
+        }
+      ],
+      cases: [
+        {
+          id: "case_1",
+          title: "Reported phishing email",
+          status: "Open",
+          createdAt: now - 2 * 60 * 60 * 1000
+        }
+      ]
+    }
   };
 }
 
-module.exports = { buildPosture };
+function getMyPosture({ user }) {
+  return summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: user?.role || "Individual" });
+}
+
+function getCompanyPosture({ user }) {
+  return summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: "Company" });
+}
+
+function getManagerPosture({ user }) {
+  // Manager sees “overview style” numbers too
+  const out = summarizeFromDbOrFallback({ userId: user?.id || user?._id || "unknown", role: "Manager" });
+  out.manager = {
+    users: 12,
+    companies: 3,
+    auditEvents: 45,
+    notifications: 8
+  };
+  out.posture.score = clamp(out.posture.score + 5, 0, 100);
+  out.posture.risk = "medium";
+  return out;
+}
+
+module.exports = {
+  getMyPosture,
+  getCompanyPosture,
+  getManagerPosture
+};

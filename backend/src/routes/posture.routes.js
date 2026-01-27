@@ -1,56 +1,51 @@
 // backend/src/routes/posture.routes.js
-// Posture endpoints for cybersecurity rooms.
-// Uses your existing auth stack: requires req.user to exist.
-// If you don't have req.user on requests yet, tell me and we’ll wire auth middleware.
-
 const express = require('express');
 const router = express.Router();
 
-const posture = require('../services/posture.service');
+/**
+ * ✅ IMPORTANT:
+ * This route expects your auth system to already attach the logged-in user to req.user.
+ * If your project uses a different pattern (ex: req.userId, req.auth, etc),
+ * tell me what you see inside backend/src/routes/me.routes.js and I’ll match it exactly.
+ */
 
-// simple guard (so endpoints don't crash)
-function requireUser(req, res) {
-  if (!req.user) {
-    res.status(401).json({ ok: false, error: 'Unauthorized (missing user). Login first.' });
-    return false;
-  }
-  return true;
-}
-
-// GET /api/posture/me  -> individual posture snapshot
-router.get('/me', (req, res) => {
+// GET /api/posture/me
+router.get('/me', async (req, res) => {
   try {
-    if (!requireUser(req, res)) return;
-    return res.json(posture.getMyPosture({ user: req.user }));
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// GET /api/posture/company -> company posture snapshot
-router.get('/company', (req, res) => {
-  try {
-    if (!requireUser(req, res)) return;
-    // optional: only allow Company / Admin / Manager
-    const role = req.user?.role;
-    if (!['Company','Admin','Manager'].includes(role)) {
-      return res.status(403).json({ ok: false, error: 'Forbidden (company posture requires Company/Admin/Manager).' });
+    // If your auth middleware sets req.user, keep this.
+    // If not, you’ll get 401 until we wire it to your auth guard.
+    const me = req.user || null;
+    if (!me) {
+      return res.status(401).json({ ok: false, error: 'Not signed in' });
     }
-    return res.json(posture.getCompanyPosture({ user: req.user }));
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
 
-// GET /api/posture/manager -> manager posture snapshot
-router.get('/manager', (req, res) => {
-  try {
-    if (!requireUser(req, res)) return;
-    const role = req.user?.role;
-    if (!['Manager','Admin'].includes(role)) {
-      return res.status(403).json({ ok: false, error: 'Forbidden (manager posture requires Manager/Admin).' });
-    }
-    return res.json(posture.getManagerPosture({ user: req.user }));
+    // ✅ MVP posture model (we’ll make it “real” once we start collecting signals)
+    // This gives you the “official-looking” panel for every room.
+    const risk = me.autoprotectEnabled ? 'low' : 'medium';
+    const score = me.autoprotectEnabled ? 86 : 62;
+
+    return res.json({
+      ok: true,
+      me: {
+        id: me.id,
+        role: me.role,
+        autoprotectEnabled: !!me.autoprotectEnabled,
+      },
+      posture: {
+        score,
+        risk,
+        factors: [
+          { key: 'autoprotect', label: 'AutoProtect', value: me.autoprotectEnabled ? 'enabled' : 'disabled' },
+          { key: 'mfa', label: 'MFA', value: 'next' },
+          { key: 'device', label: 'Device health', value: 'next' },
+        ],
+      },
+      recent: {
+        alerts: [
+          // leave empty for now; later we’ll fill with real detections + audit trail
+        ],
+      },
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }

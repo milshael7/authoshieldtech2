@@ -14,8 +14,9 @@ const companies = require('../companies/company.service');
 const { listNotifications } = require('../lib/notify');
 
 router.use(authRequired);
-// ✅ Admin and Manager both allowed (Admin automatically “sees manager room”)
-router.use(requireRole(users.ROLES.ADMIN, users.ROLES.MANAGER));
+
+// ✅ allow Manager; Admin always allowed too (override)
+router.use(requireRole(users.ROLES.MANAGER, { adminAlso: true }));
 
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
@@ -68,8 +69,6 @@ router.get('/notifications', (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 1, 1000, 200);
 
-    // listNotifications signature in your codebase is listNotifications({})
-    // so we keep it compatible and slice here.
     const all = listNotifications({}) || [];
     return res.json(all.slice(-limit).reverse());
   } catch (e) {
@@ -90,12 +89,13 @@ router.get('/audit', (req, res) => {
     const actorId = safeStr(req.query.actorId);
     const actionQ = safeStr(req.query.action).toLowerCase();
 
-    let items = (db.audit || []).slice(-limit).reverse();
+    // ✅ filter first, then limit newest-first
+    let items = (db.audit || []).slice().reverse();
 
     if (actorId) items = items.filter(ev => String(ev.actorId || '') === actorId);
     if (actionQ) items = items.filter(ev => String(ev.action || '').toLowerCase().includes(actionQ));
 
-    return res.json(items);
+    return res.json(items.slice(0, limit));
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }

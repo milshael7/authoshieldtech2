@@ -7,20 +7,47 @@ function ensureArray(db) {
   if (!Array.isArray(db.notifications)) db.notifications = [];
 }
 
+function normalizeSeverity(sev) {
+  const s = String(sev || 'info').toLowerCase().trim();
+  // keep it simple + consistent across UI
+  if (s === 'warning') return 'warn';
+  if (s === 'critical') return 'danger';
+  if (s === 'error') return 'danger';
+  if (s === 'success') return 'ok';
+  if (['info', 'warn', 'danger', 'ok'].includes(s)) return s;
+  return 'info';
+}
+
+// Always store both timestamps so all UI versions work
+function withTimes(obj, iso) {
+  return {
+    ...obj,
+    at: iso,
+    createdAt: iso, // ✅ frontend sometimes uses this
+  };
+}
+
 function createNotification({ userId = null, companyId = null, severity = 'info', title, message }) {
   const db = readDb();
   ensureArray(db);
 
-  const n = {
-    id: nanoid(),
-    at: new Date().toISOString(),
-    userId,
-    companyId,
-    severity,
-    title,
-    message,
-    read: false
-  };
+  const iso = new Date().toISOString();
+
+  const cleanTitle = String(title || '').trim();
+  const cleanMsg = String(message || '').trim();
+
+  const n = withTimes(
+    {
+      id: nanoid(),
+      userId: userId ? String(userId) : null,
+      companyId: companyId ? String(companyId) : null,
+      severity: normalizeSeverity(severity),
+      title: cleanTitle || 'Notification',
+      message: cleanMsg || '',
+      read: false,
+    },
+    iso
+  );
 
   db.notifications.push(n);
   writeDb(db);
@@ -32,17 +59,29 @@ function listNotifications({ userId, companyId } = {}) {
   ensureArray(db);
 
   return db.notifications
+    .map((n) => {
+      // ✅ migrate older notifications silently
+      const iso = n.createdAt || n.at || new Date().toISOString();
+      const fixed = withTimes(
+        {
+          ...n,
+          severity: normalizeSeverity(n.severity),
+        },
+        iso
+      );
+      return fixed;
+    })
     .filter((n) => {
       if (userId && String(n.userId || '') !== String(userId)) return false;
       if (companyId && String(n.companyId || '') !== String(companyId)) return false;
       return true;
     })
-    .sort((a, b) => (a.at < b.at ? 1 : -1));
+    .sort((a, b) => ((a.createdAt || a.at) < (b.createdAt || b.at) ? 1 : -1));
 }
 
 /**
  * markRead(id, userId?, companyId?)
- * - Backward compatible: if you call markRead(id) it will still work.
+ * - Backward compatible: markRead(id) still works.
  * - If userId/companyId provided, it will ONLY mark if it matches scope.
  */
 function markRead(id, userId = null, companyId = null) {
@@ -57,11 +96,18 @@ function markRead(id, userId = null, companyId = null) {
   if (companyId && String(n.companyId || '') !== String(companyId)) return null;
 
   n.read = true;
+
+  // ✅ ensure both timestamps exist (older records)
+  if (!n.createdAt && n.at) n.createdAt = n.at;
+  if (!n.at && n.createdAt) n.at = n.createdAt;
+
+  // ✅ normalize severity just in case
+  n.severity = normalizeSeverity(n.severity);
+
   writeDb(db);
   return n;
 }
 
-// Optional helper (nice for later UI buttons)
 function markReadAll({ userId = null, companyId = null } = {}) {
   const db = readDb();
   ensureArray(db);
@@ -70,10 +116,18 @@ function markReadAll({ userId = null, companyId = null } = {}) {
   for (const n of db.notifications) {
     if (userId && String(n.userId || '') !== String(userId)) continue;
     if (companyId && String(n.companyId || '') !== String(companyId)) continue;
+
     if (!n.read) {
       n.read = true;
       changed++;
     }
+
+    // keep timestamps consistent
+    if (!n.createdAt && n.at) n.createdAt = n.at;
+    if (!n.at && n.createdAt) n.at = n.createdAt;
+
+    // normalize severity
+    n.severity = normalizeSeverity(n.severity);
   }
 
   if (changed) writeDb(db);

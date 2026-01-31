@@ -15,8 +15,8 @@ const { listNotifications } = require('../lib/notify');
 
 router.use(authRequired);
 
-// ✅ allow Manager; Admin always allowed too (override)
-router.use(requireRole(users.ROLES.MANAGER, { adminAlso: true }));
+// ✅ Admin + Manager allowed
+router.use(requireRole(users.ROLES.ADMIN, users.ROLES.MANAGER));
 
 function clampInt(n, min, max, fallback) {
   const x = Number(n);
@@ -70,7 +70,8 @@ router.get('/notifications', (req, res) => {
     const limit = clampInt(req.query.limit, 1, 1000, 200);
 
     const all = listNotifications({}) || [];
-    return res.json(all.slice(-limit).reverse());
+    // newest first
+    return res.json(all.slice(0, limit));
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }

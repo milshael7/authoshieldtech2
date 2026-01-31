@@ -28,20 +28,9 @@ router.post('/notifications/:id/read', (req, res) => {
     const id = String(req.params.id || '').trim();
     if (!id) return res.status(400).json({ error: 'Missing notification id' });
 
-    // markRead() signature may vary, call safely
-    let n = null;
-    try {
-      n = markRead(id, req.user.id);
-    } catch {
-      n = markRead(id);
-    }
-
+    // ✅ Uses new notify.js signature (scope-safe)
+    const n = markRead(id, req.user.id);
     if (!n) return res.status(404).json({ error: 'Not found' });
-
-    // ✅ Scope check: only allow marking YOUR notifications
-    if (String(n.userId || '') !== String(req.user.id)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
 
     return res.json(n);
   } catch (e) {
@@ -54,6 +43,7 @@ router.post('/projects', (req, res) => {
   try {
     const body = req.body || {};
     const title = String(body.title || '').trim();
+
     const issue = body.issue || {};
     const issueType = String(issue.type || '').trim();
     const details = typeof issue.details === 'string' ? issue.details : '';
@@ -61,10 +51,9 @@ router.post('/projects', (req, res) => {
     if (!title) return res.status(400).json({ error: 'Missing title' });
     if (!issueType) return res.status(400).json({ error: 'Missing issue.type' });
 
-    // companyId: allow override only if sent, otherwise use user's companyId (or null)
     const companyId =
       body.companyId != null
-        ? String(body.companyId || '').trim() || null
+        ? (String(body.companyId || '').trim() || null)
         : (req.user.companyId || null);
 
     const p = createProject({

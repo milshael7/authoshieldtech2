@@ -1,14 +1,17 @@
 // backend/src/services/aiBrain.js
-// AutoProtect "Brain" (Persistent + Natural Replies)
-// Goals:
-// - Non-robotic explanations using real page context (paper trader stats, position, decision, controls)
-// - Works even if frontend sends {message, context} OR {message, context, hints}
-// - Handles trading questions + general questions (basic assistant mode)
-// - Lightweight “memory” (history + notes) saved to disk via AI_BRAIN_PATH
+// AutoProtect "Brain" (Persistent + Natural Replies) + WIN/LOSS MINDSET (locked)
+//
+// ✅ What this adds:
+// - A permanent “Mindset Policy” stored inside the brain file (persisted on disk)
+// - The AI uses the mindset when explaining trades, decisions, confidence, losses
+// - Commands:
+//   - "mindset" / "show mindset" -> prints the policy
+//   - "mindset status" -> shows version + loaded state
 //
 // Reality check:
-// - This module does NOT browse the web. It can “learn the page” from context you send + what you say.
-// - If you want true web browsing/surfacing, you’d add a backend tool layer later.
+// - This module does NOT browse the web.
+// - This does NOT place real trades.
+// - It explains + reasons + teaches based on the live dashboard context you send.
 
 const fs = require("fs");
 const path = require("path");
@@ -28,6 +31,32 @@ const DEFAULT_MAX_REPLY_CHARS = Number(process.env.AI_BRAIN_MAX_REPLY_CHARS || 1
 const WARN_EDGE_LOW = Number(process.env.AI_BRAIN_WARN_EDGE_LOW || 0.0005); // 0.05%
 const WARN_CONF_LOW = Number(process.env.AI_BRAIN_WARN_CONF_LOW || 0.55);
 
+// ------------------ ✅ LOCKED MINDSET POLICY ------------------
+
+const MINDSET_VERSION = 1;
+
+// This is the AI constitution for trading behavior (no emotion, pure logic).
+// This will be persisted inside the brain file and used in replies.
+const DEFAULT_MINDSET = {
+  version: MINDSET_VERSION,
+  title: "AutoShield Win/Loss Mindset",
+  // Short “AI-readable” rule set
+  rules: [
+    "PRIMARY PURPOSE: avoid losing money. Protect capital first.",
+    "LOSS = FAILURE. A negative trade outcome is failure. Not acceptable.",
+    "WIN = SUCCESS. Positive net outcome AND rules followed.",
+    "WAITING IS ACCEPTABLE. Missing trades is acceptable. Losing is not.",
+    "CONFIDENCE IS RULE-COMPLETION, NOT BELIEF. High confidence must mean rules were satisfied.",
+    "IF A LOSS OCCURS: assume rules were insufficient. Tighten thresholds / add constraints. Do not excuse it.",
+    "BEFORE ENTERING: if there is a reasonable path to loss under current conditions, do not trade.",
+    "RISK CONTROLS ARE OBLIGATORY: daily loss limits, cooldowns, and sizing caps exist to prevent failure cascades.",
+  ],
+  // Human readable summary (shown when user asks “mindset”)
+  summary:
+    "The AI exists to avoid failure. Failure is losing money. Success is returning money with profit while obeying rules. " +
+    "Waiting is allowed. Confidence must reflect rule completion. A loss means the system must tighten and improve.",
+};
+
 // ------------------ utils ------------------
 
 function ensureDirFor(filePath) {
@@ -35,10 +64,6 @@ function ensureDirFor(filePath) {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   } catch {}
-}
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
 }
 
 function safeStr(v, max = 5000) {
@@ -83,18 +108,15 @@ function humanReason(r) {
   return r;
 }
 
-function truncate(s, max = DEFAULT_MAX_REPLY_CHARS) {
+function truncate(s, max) {
+  const limit = Number(max) || DEFAULT_MAX_REPLY_CHARS;
   const t = String(s || "");
-  if (t.length <= max) return t;
-  return t.slice(0, max - 3) + "...";
+  if (t.length <= limit) return t;
+  return t.slice(0, limit - 3) + "...";
 }
 
 function normalizeMessage(s) {
   return safeStr(s, 2000).toLowerCase();
-}
-
-function isQuestionLike(m) {
-  return /\?$/.test(m) || /\b(what|why|how|when|where|who|can you|could you|do you)\b/i.test(m);
 }
 
 function winRate(w, l) {
@@ -109,9 +131,12 @@ function winRate(w, l) {
 
 function defaultBrain() {
   return {
-    version: 2,
+    version: 3,
     createdAt: nowIso(),
     updatedAt: nowIso(),
+
+    // ✅ persisted mindset (so it survives restarts/deploys if AI_BRAIN_PATH is persistent)
+    mindset: DEFAULT_MINDSET,
 
     history: [], // [{ts, role:'user'|'ai', text}]
     notes: [], // [{ts, text}]
@@ -145,6 +170,14 @@ function loadBrain() {
       history: Array.isArray(parsed.history) ? parsed.history : base.history,
       notes: Array.isArray(parsed.notes) ? parsed.notes : base.notes,
     };
+
+    // ensure mindset always exists + versioned
+    if (!brain.mindset || typeof brain.mindset !== "object") {
+      brain.mindset = DEFAULT_MINDSET;
+    }
+    if (Number(brain.mindset.version || 0) < MINDSET_VERSION) {
+      brain.mindset = DEFAULT_MINDSET;
+    }
 
     brain.history = brain.history.slice(-MAX_HISTORY);
     brain.notes = brain.notes.slice(-MAX_NOTES);
@@ -212,6 +245,11 @@ function getSnapshot() {
     notesCount: brain.notes.length,
     lastContext: !!brain.lastContext,
     config: brain.config,
+    mindset: {
+      version: brain.mindset?.version || 0,
+      title: brain.mindset?.title || "—",
+      rulesCount: Array.isArray(brain.mindset?.rules) ? brain.mindset.rules.length : 0,
+    },
   };
 }
 
@@ -224,11 +262,9 @@ function resetBrain() {
 
 function extractTop(ctx) {
   const c = ctx || {};
-  // sometimes the client nests
   const symbol = safeStr(c.symbol || c?.context?.symbol || "BTCUSD", 40) || "BTCUSD";
   const mode = safeStr(c.mode || c?.context?.mode || "Paper", 40) || "Paper";
   const last = safeNum(c.last ?? c?.context?.last, NaN);
-
   return { symbol, mode, last };
 }
 
@@ -236,7 +272,6 @@ function extractPaper(ctx) {
   const c = ctx || {};
   const paper = c.paper || c?.context?.paper || {};
 
-  // Trading.jsx uses: cashBalance, equity, pnl, unrealizedPnL, realized, costs, learnStats, position, config
   const cashBalance = safeNum(paper.cashBalance ?? paper.balance ?? paper.cash ?? 0, 0);
   const equity = safeNum(paper.equity ?? cashBalance, cashBalance);
   const pnl = safeNum(paper.pnl ?? paper.realized?.net ?? paper.net ?? 0, 0);
@@ -269,7 +304,6 @@ function extractPaper(ctx) {
   const trades = Array.isArray(paper.trades) ? paper.trades : [];
   const lastTrade = trades.length ? trades[trades.length - 1] : null;
 
-  // paper trader config can be at paper.config or paper.owner depending on your snapshot
   const cfg = paper.config || paper.owner || null;
 
   return {
@@ -285,37 +319,38 @@ function extractPaper(ctx) {
     tradesCount: trades.length,
     lastTrade,
     config: cfg,
-    // optional sizing/limits if snapshot includes them
     sizing: paper.sizing || null,
     limits: paper.limits || null,
   };
 }
 
-function extractHints(contextMaybe, hintsMaybe) {
-  // VoiceAI.jsx sends hints in req.body.hints (best)
-  // but some callers might nest hints inside context
-  return (
-    hintsMaybe ||
-    (contextMaybe && contextMaybe.hints) ||
-    (contextMaybe && contextMaybe?.context && contextMaybe.context.hints) ||
-    null
-  );
+// ------------------ mindset helpers ------------------
+
+function mindsetHeaderLine() {
+  return "Mindset: WIN is success. LOSS is failure. Waiting is allowed. Capital protection first.";
+}
+
+function mindsetLongText() {
+  const ms = brain.mindset || DEFAULT_MINDSET;
+  const lines = [];
+  lines.push(`${ms.title} (v${ms.version})`);
+  lines.push("");
+  lines.push(ms.summary);
+  lines.push("");
+  lines.push("Rules:");
+  for (const r of ms.rules || []) lines.push(`- ${r}`);
+  return lines.join("\n");
 }
 
 // ------------------ reply building ------------------
-
-function tonePrefix() {
-  const t = String(brain.config?.tone || DEFAULT_TONE).toLowerCase();
-  if (t === "business") return "";
-  if (t === "friendly") return "";
-  return "";
-}
 
 function scoreboardText(top, p) {
   const wr = winRate(p.realized.wins, p.realized.losses);
   const lastPx = Number.isFinite(top.last) ? money(top.last).replace("$", "") : "—";
 
   const lines = [
+    mindsetHeaderLine(),
+    "",
     `Trading snapshot (${top.symbol} • ${top.mode})`,
     `Last price: ${lastPx}`,
     `Cash: ${money(p.cashBalance)} • Equity: ${money(p.equity)} • Unrealized: ${money(p.unrealizedPnL)}`,
@@ -333,9 +368,9 @@ function decisionText(top, p) {
   const conf = p.learnStats.confidence;
 
   const warnings = [];
-  if (p.learnStats.ticksSeen < 50) warnings.push("Still early — the model is warming up.");
-  if (Math.abs(edge) < WARN_EDGE_LOW) warnings.push("Edge looks small right now (choppy market).");
-  if (conf < WARN_CONF_LOW) warnings.push("Confidence is low — waiting is usually smarter here.");
+  if (p.learnStats.ticksSeen < 50) warnings.push("Warm-up: still collecting data; WAIT is acceptable.");
+  if (Math.abs(edge) < WARN_EDGE_LOW) warnings.push("Edge is small (choppy conditions). Avoid entries.");
+  if (conf < WARN_CONF_LOW) warnings.push("Confidence is low (rule completion not strong). WAIT.");
 
   const pos = p.position
     ? [
@@ -348,20 +383,22 @@ function decisionText(top, p) {
     : "Open position: none";
 
   const lines = [
+    mindsetHeaderLine(),
+    "",
     `Decision report (${top.symbol} • ${top.mode})`,
     pos,
     `Decision: ${p.learnStats.decision}`,
-    `Confidence: ${pct01(conf, 0)} • Trend edge: ${pct01(edge, 2)} • Ticks: ${p.learnStats.ticksSeen}`,
+    `Confidence (rule-completion): ${pct01(conf, 0)} • Trend edge: ${pct01(edge, 2)} • Ticks: ${p.learnStats.ticksSeen}`,
     `Reason: ${reason}`,
   ];
 
   if (warnings.length) {
     lines.push("");
-    lines.push("Quick read:");
+    lines.push("Mindset enforcement (avoid failure):");
     for (const w of warnings) lines.push(`- ${w}`);
   }
 
-  // add config hints (if available)
+  // show controls if present
   if (p.config) {
     const bp = safeNum(p.config.baselinePct, NaN);
     const mp = safeNum(p.config.maxPct, NaN);
@@ -384,7 +421,7 @@ function decisionText(top, p) {
 
 function lastTradeText(top, p) {
   const t = p.lastTrade;
-  if (!t) return `No trades logged yet for ${top.symbol}. It may still be warming up.`;
+  if (!t) return `No trades logged yet for ${top.symbol}. (Mindset: WAIT is acceptable. Loss is not.)`;
 
   const type = safeStr(t.type || "—", 30);
   const sym = safeStr(t.symbol || top.symbol, 30);
@@ -395,14 +432,24 @@ function lastTradeText(top, p) {
   const profit = t.profit != null ? money(t.profit) : null;
   const exit = t.exitReason ? humanReason(t.exitReason) : null;
 
+  const verdict =
+    profit == null
+      ? "Result: —"
+      : profit.startsWith("-")
+      ? "Result: LOSS (failure). Tighten rules/thresholds."
+      : "Result: WIN (success). Validate rules worked.";
+
   const lines = [
+    mindsetHeaderLine(),
+    "",
     `Last trade (${sym})`,
     `Time: ${time}`,
     `Type: ${type} • Strategy: ${strat}`,
     `Price: ${px} • Notional: ${usd}`,
+    verdict,
   ];
 
-  if (profit != null) lines.push(`Result: ${profit}${profit.startsWith("-") ? " (loss)" : " (gain)"}`);
+  if (profit != null) lines.push(`Net: ${profit}`);
   if (exit) lines.push(`Exit reason: ${exit}`);
   if (t.note) lines.push(`Note: ${safeStr(t.note, 400)}`);
 
@@ -411,71 +458,52 @@ function lastTradeText(top, p) {
 
 function helpText() {
   return [
-    "You can ask me stuff like:",
+    "Commands:",
+    `- "mindset" (show the win/loss mindset policy)`,
     `- "show scoreboard"`,
     `- "why did it buy/sell?"`,
     `- "what is the current decision?"`,
     `- "explain last trade"`,
     `- "what are my fees?"`,
-    `- "what should I change to reduce losses?"`,
     `- "add note: ..."`,
-
-    "",
-    "And you can ask general questions too (I’ll answer like a normal assistant).",
   ].join("\n");
 }
 
 function improvementTips(p) {
-  // Practical, page-specific tips (without promising magic)
+  // Practical, mindset-aligned tips:
   const tips = [];
 
-  // If fees are large relative to net
   const fee = p.costs.feePaid + p.costs.slippageCost + p.costs.spreadCost;
   const net = p.realized.net;
+
   if (fee > 0 && Math.abs(net) > 0 && fee > Math.abs(net) * 0.6) {
     tips.push(
-      "Costs are eating a lot of performance. Consider: fewer trades/day, slightly longer holds, or larger notional trades so fees don’t dominate."
+      "Costs are eating performance. Mindset says: avoid failure → reduce trade frequency or raise entry quality."
     );
   }
 
   if (p.learnStats.confidence < WARN_CONF_LOW) {
-    tips.push("Confidence is low. Best move is usually: WAIT more and raise the entry threshold (MIN_EDGE / MIN_CONF).");
-  }
-
-  if (p.limits?.lossesToday >= 2) {
-    tips.push("It hit the daily loss control (force baseline). That’s good — it reduces bleeding after a bad streak.");
-  }
-
-  if (p.limits?.halted) {
-    tips.push(`Trading halted: ${p.limits.haltReason || "safety stop"}. Reset paper or reduce risk before resuming.`);
-  }
-
-  if (!tips.length) {
-    tips.push("If you want tighter behavior: add daily loss cutoff + cooldown + an ‘edge threshold’ before entering.");
-  }
-
-  return ["Here’s how to reduce one-sided losing:", ...tips.map((t) => `- ${t}`)].join("\n");
-}
-
-// Very light “general assistant” fallback (no web, no claims)
-function generalAssistantReply(msg) {
-  const m = normalizeMessage(msg);
-
-  if (m.includes("who are you") || m.includes("what are you")) {
-    return "I’m AutoProtect — the assistant for your dashboard. I can explain your trading stats in real time, and I can also answer general questions.";
-  }
-
-  if (m.includes("how do i") || m.includes("what should i do")) {
-    return (
-      "Tell me what you’re trying to do and what tools you’re using (phone/PC, backend/frontend). " +
-      "If it’s about trading, ask from inside the Trading Room so I can use your live context."
+    tips.push(
+      "Confidence is low (rule completion weak). Mindset says: WAIT. Raise entry thresholds (MIN_EDGE / MIN_CONF)."
     );
   }
 
-  // Default
+  if (p.limits?.halted) {
+    tips.push(`Trading is halted by safety stop: ${p.limits.haltReason || "unknown"}. Keep it halted until rules are tightened.`);
+  }
+
+  if (!tips.length) {
+    tips.push("To reduce failure: tighten entry filters, add cooldown after loss, enforce daily loss cutoff, and cap sizing.");
+  }
+
+  return ["Mindset-aligned improvements (avoid loss):", ...tips.map((t) => `- ${t}`)].join("\n");
+}
+
+// Very light “general assistant” fallback (no web, no fake claims)
+function generalAssistantReply(msg) {
   return (
-    "I can help. If this is about your Trading Room, ask: “show scoreboard” or “why did it enter?” " +
-    "If it’s a general question, ask it directly and I’ll answer normally."
+    "I can explain your trading dashboard using the live context you send (wins/losses, P&L, decisions, risk). " +
+    "Ask: “mindset”, “show scoreboard”, or “why did it enter?”"
   );
 }
 
@@ -483,15 +511,14 @@ function generalAssistantReply(msg) {
 
 /**
  * answer(message, context, hints)
- * - Backward compatible with your current ai.routes.js which calls answer(msg, context)
+ * Backward compatible with ai.routes.js calling answer(msg, context)
  */
-function answer(message, context, hints) {
+function answer(message, context /*, hints */) {
   const msg = safeStr(message, 4000);
   const m = normalizeMessage(msg);
 
   const top = extractTop(context || {});
   const paper = extractPaper(context || {});
-  const h = extractHints(context || {}, hints);
 
   // memory update
   addHistory("user", msg);
@@ -512,10 +539,23 @@ function answer(message, context, hints) {
       confidence: paper.learnStats.confidence,
       ticksSeen: paper.learnStats.ticksSeen,
     },
-    hintsPresent: !!h,
   });
 
-  // --------- command-like intents ----------
+  // --------- mindset commands ----------
+  if (m === "mindset" || m.includes("show mindset")) {
+    const reply = truncate(mindsetLongText(), brain.config?.maxReplyChars);
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  if (m.includes("mindset status")) {
+    const ms = brain.mindset || DEFAULT_MINDSET;
+    const reply = `Mindset status\n- title: ${ms.title}\n- version: ${ms.version}\n- rules: ${(ms.rules || []).length}\n- brain file: ${BRAIN_PATH}`;
+    addHistory("ai", reply);
+    return reply;
+  }
+
+  // --------- other command-like intents ----------
   if (m === "help" || m.includes("what can you do") || m.includes("commands")) {
     const reply = helpText();
     addHistory("ai", reply);
@@ -531,13 +571,14 @@ function answer(message, context, hints) {
   }
 
   if (m.includes("brain status") || (m.includes("brain") && m.includes("status"))) {
+    const snap = getSnapshot();
     const reply =
       `Brain status\n` +
-      `- Brain file: ${BRAIN_PATH}\n` +
-      `- Updated: ${brain.updatedAt}\n` +
-      `- History: ${brain.history.length} messages\n` +
-      `- Notes: ${brain.notes.length}\n\n` +
-      `To persist across deploys, set AI_BRAIN_PATH to your Render Disk mount path (example: /var/data/ai_brain.json).`;
+      `- Brain file: ${snap.brainPath}\n` +
+      `- Updated: ${snap.updatedAt}\n` +
+      `- History: ${snap.historyCount}\n` +
+      `- Notes: ${snap.notesCount}\n` +
+      `- Mindset: ${snap.mindset.title} (v${snap.mindset.version})`;
     addHistory("ai", reply);
     return reply;
   }
@@ -564,15 +605,20 @@ function answer(message, context, hints) {
     m.includes("history");
 
   if (tradingIntent) {
-    // more specific routing
     if (m.includes("last trade") || m.includes("explain last trade")) {
-      const reply = truncate(lastTradeText(top, paper), brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS);
+      const reply = truncate(lastTradeText(top, paper), brain.config?.maxReplyChars);
       addHistory("ai", reply);
       return reply;
     }
 
-    if (m.includes("scoreboard") || m.includes("wins") || m.includes("loss") || m.includes("p&l") || m.includes("pnl")) {
-      const reply = truncate(scoreboardText(top, paper), brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS);
+    if (
+      m.includes("scoreboard") ||
+      m.includes("wins") ||
+      m.includes("loss") ||
+      m.includes("p&l") ||
+      m.includes("pnl")
+    ) {
+      const reply = truncate(scoreboardText(top, paper), brain.config?.maxReplyChars);
       addHistory("ai", reply);
       return reply;
     }
@@ -580,6 +626,8 @@ function answer(message, context, hints) {
     if (m.includes("fees") || m.includes("slippage") || m.includes("spread") || m.includes("cost")) {
       const reply = truncate(
         [
+          mindsetHeaderLine(),
+          "",
           "Costs breakdown",
           `Fees paid: ${money(paper.costs.feePaid)}`,
           `Slippage cost: ${money(paper.costs.slippageCost)}`,
@@ -587,30 +635,26 @@ function answer(message, context, hints) {
           "",
           improvementTips(paper),
         ].join("\n"),
-        brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS
+        brain.config?.maxReplyChars
       );
       addHistory("ai", reply);
       return reply;
     }
 
-    if (m.includes("reduce losses") || m.includes("stop losing") || m.includes("one-sided") || m.includes("risk")) {
-      const reply = truncate(improvementTips(paper), brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS);
+    if (m.includes("reduce losses") || m.includes("stop losing") || m.includes("risk")) {
+      const reply = truncate(improvementTips(paper), brain.config?.maxReplyChars);
       addHistory("ai", reply);
       return reply;
     }
 
     // default “decision / why”
-    const reply = truncate(decisionText(top, paper), brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS);
+    const reply = truncate(decisionText(top, paper), brain.config?.maxReplyChars);
     addHistory("ai", reply);
     return reply;
   }
 
-  // --------- “general questions” (outside trading) ----------
-  // We still keep it grounded and not robotic.
-  const reply = truncate(
-    tonePrefix() + generalAssistantReply(msg),
-    brain.config?.maxReplyChars || DEFAULT_MAX_REPLY_CHARS
-  );
+  // --------- general fallback ----------
+  const reply = truncate(generalAssistantReply(msg), brain.config?.maxReplyChars);
   addHistory("ai", reply);
   return reply;
 }

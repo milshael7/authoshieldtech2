@@ -1,8 +1,12 @@
 // backend/src/routes/posture.routes.js
 // Cybersecurity Posture — FINAL LOCKED VERSION
-// ✅ Enforces AutoProtect = Individual ONLY
+// ✅ AutoProtect rules enforced correctly
+//    - Admin: Global mirror (no AP)
+//    - Manager: AutoProtect ENABLED (FREE)
+//    - Company: AutoProtect DISABLED (manual only)
+//    - Individual: AutoProtect PAID ONLY
 // ✅ Prevents room leakage
-// ✅ Admin gets GLOBAL VIEW (read-only mirror)
+// ✅ Stable – no refactor required later
 
 const express = require('express');
 const router = express.Router();
@@ -37,27 +41,44 @@ function isIndividual(u) {
 
 // -------------------- AutoProtect enforcement --------------------
 function autoProtectStatus(user) {
-  // 🚨 HARD RULE: ONLY INDIVIDUAL USERS MAY USE AUTOPROTECT
-  if (!isIndividual(user)) {
+  // 🚫 Companies NEVER get AutoProtect
+  if (isCompany(user)) {
     return {
       enabled: false,
-      reason: 'AutoProtect is available to Individual users only.',
+      reason: 'AutoProtect is not available for Company accounts.',
     };
   }
 
-  const enabled = !!(user.autoprotectEnabled || user.autoprotechEnabled);
+  // ✅ Managers ALWAYS get AutoProtect (FREE)
+  if (isManager(user)) {
+    return {
+      enabled: true,
+      reason: 'AutoProtect enabled for Manager role.',
+    };
+  }
+
+  // 💰 Individuals ONLY if paid
+  if (isIndividual(user)) {
+    const enabled = !!(user.autoprotectEnabled || user.autoprotechEnabled);
+    return {
+      enabled,
+      reason: enabled
+        ? 'AutoProtect is active for this account.'
+        : 'Upgrade required to enable AutoProtect.',
+    };
+  }
+
+  // Admin / fallback
   return {
-    enabled,
-    reason: enabled
-      ? 'AutoProtect is active.'
-      : 'AutoProtect is not enabled for this account.',
+    enabled: false,
+    reason: 'AutoProtect not applicable.',
   };
 }
 
 // -------------------- scope resolution --------------------
 function scopeFor(reqUser) {
   if (isAdmin(reqUser)) {
-    return { type: 'global' }; // admin mirror view
+    return { type: 'global' }; // Admin mirror view
   }
 
   if (isManager(reqUser)) {
@@ -138,7 +159,7 @@ router.get('/summary', (req, res) => {
     });
   }
 
-  // individual / manager
+  // Individual / Manager view
   return res.json({
     scope,
     totals: {

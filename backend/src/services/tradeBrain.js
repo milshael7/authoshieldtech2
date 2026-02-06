@@ -1,109 +1,126 @@
 // backend/src/services/tradeBrain.js
-// ONE brain contract used for BOTH paper + live.
-// Brain decides. Executors execute.
+// ONE decision brain for BOTH paper + live trading.
+// Brain decides. Executors execute. No exceptions.
 
-const aiBrain = require("./aiBrain"); // your existing brain
+const aiBrain = require("./aiBrain");
 
-// Hard safety defaults (can be overridden by env)
+// ---------------- SAFETY CONSTANTS ----------------
 const MIN_CONF = Number(process.env.TRADE_MIN_CONF || 0.62);
 const MIN_EDGE = Number(process.env.TRADE_MIN_EDGE || 0.0007); // 0.07%
 const MAX_TRADES_PER_DAY = Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
 
-// Mindset rules (owner preference) — stored once and reused
-const MINDSET = {
+const ALLOWED_ACTIONS = new Set(["WAIT", "BUY", "SELL", "CLOSE"]);
+
+// ---------------- MINDSET (IMMUTABLE) ----------------
+const MINDSET = Object.freeze({
   winIsSuccess: true,
   loseIsFailure: true,
   ruleFirst: true,
   message:
     "Winning is success. Losing is failure. The mission is to avoid losing. " +
-    "Follow the rules before entering. If rules are not met, WAIT. " +
-    "If you lose, treat it as a failure signal: learn, tighten filters, and do not repeat.",
-};
+    "Rules come before entries. If rules are not met, WAIT. " +
+    "Losses are failure signals: learn, tighten filters, and do not repeat.",
+});
 
+// ---------------- HELPERS ----------------
 function safeNum(x, fallback = 0) {
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
 }
 
-/**
- * makeDecision({symbol, mode, last, paper})
- * Returns a strict object that executors can use.
- */
-function makeDecision(context) {
-  const symbol = String(context?.symbol || "BTCUSDT");
-  const last = safeNum(context?.last, NaN);
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
-  const paper = context?.paper || {};
+// ---------------- CORE DECISION ----------------
+/**
+ * makeDecision(context)
+ * Returns a STRICT execution plan.
+ */
+function makeDecision(context = {}) {
+  const symbol = String(context.symbol || "BTCUSDT");
+  const last = safeNum(context.last, NaN);
+
+  const paper = context.paper || {};
   const learn = paper.learnStats || {};
   const limits = paper.limits || {};
   const config = paper.config || {};
 
-  // Pull the brain’s current “decision language”
-  // (We use your aiBrain explanation engine to stay consistent with the UI.)
-  const decision = String(learn.decision || "WAIT").toUpperCase();
-  const confidence = safeNum(learn.confidence, 0);
-  const edge = safeNum(learn.trendEdge, 0);
+  // Ask AI brain for its view (authoritative)
+  const aiView = aiBrain.decide
+    ? aiBrain.decide({ symbol, last, paper })
+    : {};
+
+  const rawDecision = String(
+    aiView.action || learn.decision || "WAIT"
+  ).toUpperCase();
+
+  const action = ALLOWED_ACTIONS.has(rawDecision)
+    ? rawDecision
+    : "WAIT";
+
+  const confidence = safeNum(aiView.confidence ?? learn.confidence, 0);
+  const edge = safeNum(aiView.edge ?? learn.trendEdge, 0);
+
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  // -------- HARD SAFETY GATES (same for paper + live) --------
-  let action = decision;
+  let finalAction = action;
   let blockedReason = "";
 
+  // ---------------- HARD SAFETY GATES ----------------
   if (!Number.isFinite(last)) {
-    action = "WAIT";
+    finalAction = "WAIT";
     blockedReason = "Missing last price.";
+  } else if (limits.halted) {
+    finalAction = "WAIT";
+    blockedReason = `Halted: ${limits.haltReason || "safety stop"}`;
   } else if (tradesToday >= MAX_TRADES_PER_DAY) {
-    action = "WAIT";
+    finalAction = "WAIT";
     blockedReason = `Daily trade limit reached (${tradesToday}/${MAX_TRADES_PER_DAY}).`;
   } else if (confidence < MIN_CONF) {
-    action = "WAIT";
+    finalAction = "WAIT";
     blockedReason = `Confidence too low (${confidence.toFixed(2)} < ${MIN_CONF}).`;
   } else if (Math.abs(edge) < MIN_EDGE) {
-    action = "WAIT";
+    finalAction = "WAIT";
     blockedReason = `Edge too small (${edge.toFixed(6)} < ${MIN_EDGE}).`;
   }
 
-  // If your paper trader already halts, respect it in BOTH modes
-  if (limits.halted) {
-    action = "WAIT";
-    blockedReason = `Halted by safety stop: ${limits.haltReason || "unknown"}`;
-  }
+  // ---------------- RISK MODEL ----------------
+  const baselinePct = clamp(safeNum(config.baselinePct, 0.01), 0.001, 0.02);
+  const maxPct = clamp(safeNum(config.maxPct, 0.03), baselinePct, 0.05);
 
-  // -------- Position sizing contract --------
-  // Keep it simple now: use config.baselinePct/maxPct if present, else fixed tiny size.
-  const baselinePct = safeNum(config.baselinePct, 0.01);
-  const maxPct = safeNum(config.maxPct, 0.03);
+  const riskPct =
+    lossesToday >= 2
+      ? baselinePct
+      : clamp(baselinePct * 2, baselinePct, maxPct);
 
-  // If losing streak today, force baseline
-  const riskPct = lossesToday >= 2 ? baselinePct : Math.min(maxPct, baselinePct * 2);
+  const slPct = clamp(safeNum(config.slPct, 0.005), 0.002, 0.02);
+  const tpPct = clamp(safeNum(config.tpPct, 0.01), slPct, 0.05);
 
-  // SL/TP placeholder: you’ll wire your real logic later
-  const slPct = safeNum(config.slPct, 0.005); // 0.5%
-  const tpPct = safeNum(config.tpPct, 0.010); // 1.0%
-
-  const plan = {
+  // ---------------- FINAL PLAN ----------------
+  return {
     symbol,
-    action, // WAIT | BUY | SELL | CLOSE
+    action: finalAction,
     confidence,
     edge,
     riskPct,
     slPct,
     tpPct,
-    mindset: MINDSET, // stored here so UI + logs can display it
+    mindset: MINDSET,
     blockedReason,
     ts: Date.now(),
   };
-
-  return plan;
 }
 
-/**
- * explain(message, context)
- * Uses your aiBrain to produce the human-readable explanation for the UI.
- */
+// ---------------- EXPLAIN (UI / LOGS) ----------------
 function explain(message, context) {
-  return aiBrain.answer(message, context);
+  return aiBrain.answer
+    ? aiBrain.answer(message, context)
+    : "AI explanation unavailable.";
 }
 
-module.exports = { makeDecision, explain };
+module.exports = {
+  makeDecision,
+  explain,
+};

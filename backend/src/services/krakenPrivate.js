@@ -1,173 +1,185 @@
 // backend/src/services/krakenPrivate.js
 // Kraken Private REST API helper (signed requests)
-// NOTE: Funds stay on Kraken. This verifies keys + reads balances + (optionally) places orders
-// Safety locks: LIVE_TRADING_ENABLED + LIVE_TRADE_DRY_RUN + LIVE_TRADE_ARMED
+// Funds NEVER leave Kraken unless ALL safety locks are enabled
 
-const crypto = require('crypto');
+const crypto = require("crypto");
 
-const BASE_URL = 'https://api.kraken.com';
+// Node 18+ has fetch, but we guard just in case
+const fetchFn = global.fetch || ((...args) =>
+  import("node-fetch").then(({ default: f }) => f(...args)));
 
+const BASE_URL = "https://api.kraken.com";
+
+/* ------------------ ENV HELPERS ------------------ */
 function envBool(name, fallback = false) {
   const v = process.env[name];
-  if (v === undefined || v === null || v === '') return fallback;
-  return String(v).toLowerCase() === 'true';
+  if (v === undefined || v === null || v === "") return fallback;
+  return String(v).toLowerCase() === "true";
 }
 
 function getKeysSafe() {
-  const key = (process.env.KRAKEN_API_KEY || '').trim();
-  const secret = (process.env.KRAKEN_API_SECRET || '').trim();
-  return { key, secret, ok: !!(key && secret) };
+  const key = (process.env.KRAKEN_API_KEY || "").trim();
+  const secret = (process.env.KRAKEN_API_SECRET || "").trim();
+  return { key, secret, ok: Boolean(key && secret) };
 }
 
 function requireKeys() {
   const { key, secret, ok } = getKeysSafe();
-  if (!ok) throw new Error('Missing Kraken keys (KRAKEN_API_KEY / KRAKEN_API_SECRET)');
+  if (!ok) {
+    throw new Error(
+      "Missing Kraken keys (KRAKEN_API_KEY / KRAKEN_API_SECRET)"
+    );
+  }
   return { key, secret };
 }
 
+/* ------------------ CRYPTO ------------------ */
 function b64ToBuf(b64) {
-  return Buffer.from(b64, 'base64');
+  return Buffer.from(b64, "base64");
 }
 
 function sha256(buf) {
-  return crypto.createHash('sha256').update(buf).digest();
+  return crypto.createHash("sha256").update(buf).digest();
 }
 
 function hmacSha512(secretBuf, msgBuf) {
-  return crypto.createHmac('sha512', secretBuf).update(msgBuf).digest('base64');
+  return crypto.createHmac("sha512", secretBuf).update(msgBuf).digest("base64");
 }
 
+/* ------------------ NONCE (CRITICAL FIX) ------------------ */
+// Kraken REQUIRES strictly increasing nonces
+let lastNonce = Date.now();
+function nextNonce() {
+  const now = Date.now();
+  lastNonce = now > lastNonce ? now : lastNonce + 1;
+  return String(lastNonce);
+}
+
+/* ------------------ SAFETY LOCKS ------------------ */
 function liveConfig() {
-  // 3-lock safety system
-  const enabled = envBool('LIVE_TRADING_ENABLED', false);
-  const dryRun = envBool('LIVE_TRADE_DRY_RUN', true);
-  const armed = envBool('LIVE_TRADE_ARMED', false);
-  return { enabled, dryRun, armed };
+  return {
+    enabled: envBool("LIVE_TRADING_ENABLED", false),
+    dryRun: envBool("LIVE_TRADE_DRY_RUN", true),
+    armed: envBool("LIVE_TRADE_ARMED", false),
+  };
 }
 
+/* ------------------ CORE REQUEST ------------------ */
 async function privateRequest(path, bodyObj = {}) {
   const { key, secret } = requireKeys();
 
-  const nonce = Date.now().toString();
+  const nonce = nextNonce();
   const form = new URLSearchParams({ nonce, ...bodyObj }).toString();
 
-  // Kraken signature: HMAC-SHA512( base64_decode(secret), uri_path + SHA256(nonce + POSTDATA) )
+  // Kraken signature:
+  // HMAC-SHA512( base64_decode(secret), path + SHA256(nonce + POSTDATA) )
   const hash = sha256(Buffer.from(nonce + form));
   const msg = Buffer.concat([Buffer.from(path), hash]);
   const sig = hmacSha512(b64ToBuf(secret), msg);
 
-  const url = BASE_URL + path;
-
-  const res = await fetch(url, {
-    method: 'POST',
+  const res = await fetchFn(BASE_URL + path, {
+    method: "POST",
     headers: {
-      'API-Key': key,
-      'API-Sign': sig,
-      'Content-Type': 'application/x-www-form-urlencoded',
+      "API-Key": key,
+      "API-Sign": sig,
+      "Content-Type": "application/x-www-form-urlencoded",
     },
     body: form,
   });
 
-  const json = await res.json().catch(() => ({}));
-
-  // Kraken returns 200 even with errors sometimes; check both
-  const errList = json?.error;
-  if (!res.ok) {
-    const err = errList || [`HTTP_${res.status}`];
-    throw new Error(`Kraken error: ${Array.isArray(err) ? err.join(',') : String(err)}`);
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error("Kraken: Invalid JSON response");
   }
-  if (Array.isArray(errList) && errList.length) {
-    throw new Error(`Kraken error: ${errList.join(',')}`);
+
+  // Kraken may return HTTP 200 with errors
+  if (!res.ok || (Array.isArray(json.error) && json.error.length)) {
+    const err =
+      json?.error?.join(", ") ||
+      `HTTP_${res.status} ${res.statusText}`;
+    throw new Error(`Kraken error: ${err}`);
+  }
+
+  if (!json.result) {
+    throw new Error("Kraken error: Empty result");
   }
 
   return json.result;
 }
 
-// ---------- Read helpers ----------
+/* ------------------ READ HELPERS ------------------ */
 async function getBalance() {
-  // returns { ZUSD:"12.34", XXBT:"0.001", ... }
-  return privateRequest('/0/private/Balance', {});
+  return privateRequest("/0/private/Balance");
 }
 
 async function getOpenOrders() {
-  return privateRequest('/0/private/OpenOrders', {});
+  return privateRequest("/0/private/OpenOrders");
 }
 
 async function getTradeBalance() {
-  // useful to show "equity" in one place (still on Kraken)
-  return privateRequest('/0/private/TradeBalance', { asset: 'ZUSD' });
+  return privateRequest("/0/private/TradeBalance", { asset: "ZUSD" });
 }
 
-// ---------- Trading helper (Stage C) ----------
-// IMPORTANT: Kraken pair naming can vary; these are common.
-// You can extend this map later for more symbols.
+/* ------------------ PAIR MAP ------------------ */
 const PAIR_MAP = {
-  BTCUSDT: 'XBTUSDT',
-  ETHUSDT: 'ETHUSDT',
-  BTCUSD: 'XBTUSD',
-  ETHUSD: 'ETHUSD',
+  BTCUSDT: "XBTUSDT",
+  ETHUSDT: "ETHUSDT",
+  BTCUSD: "XBTUSD",
+  ETHUSD: "ETHUSD",
 };
 
-// Place a MARKET order in quote currency sizing (USD/USDT).
-// For market orders on Kraken, you typically provide volume in BASE units.
-// To keep it simple + safe, we do a small "usd -> volume estimate" using last price from caller.
+function normalizePair(symbol) {
+  const s = String(symbol || "").toUpperCase().replace(/[^A-Z]/g, "");
+  return PAIR_MAP[s] || s;
+}
+
+/* ------------------ TRADING (SAFE) ------------------ */
 async function placeMarketOrder({ symbol, side, usd, lastPrice }) {
   const { enabled, dryRun, armed } = liveConfig();
   const { ok: keysPresent } = getKeysSafe();
 
-  if (!enabled) {
-    return { ok: false, blocked: true, reason: 'LIVE_TRADING_DISABLED' };
-  }
-  if (!keysPresent) {
-    return { ok: false, blocked: true, reason: 'KRAKEN_KEYS_MISSING' };
-  }
-  if (!armed) {
-    return { ok: false, blocked: true, reason: 'LIVE_NOT_ARMED' };
-  }
+  if (!enabled)
+    return { ok: false, blocked: true, reason: "LIVE_TRADING_DISABLED" };
+  if (!keysPresent)
+    return { ok: false, blocked: true, reason: "KRAKEN_KEYS_MISSING" };
+  if (!armed)
+    return { ok: false, blocked: true, reason: "LIVE_NOT_ARMED" };
 
-  const s = String(symbol || '').trim();
-  const pair = PAIR_MAP[s] || s;
-
-  const dir = String(side || '').toUpperCase() === 'SELL' ? 'sell' : 'buy';
+  const pair = normalizePair(symbol);
+  const dir = String(side).toUpperCase() === "SELL" ? "sell" : "buy";
 
   const usdNum = Number(usd);
-  if (!Number.isFinite(usdNum) || usdNum <= 0) {
-    return { ok: false, blocked: true, reason: 'INVALID_USD_SIZE' };
-  }
-
   const px = Number(lastPrice);
-  if (!Number.isFinite(px) || px <= 0) {
-    return { ok: false, blocked: true, reason: 'MISSING_LAST_PRICE' };
-  }
 
-  // Estimate base volume
-  // Example: $50 BTC at $95k => 0.000526 BTC
-  const vol = usdNum / px;
+  if (!Number.isFinite(usdNum) || usdNum <= 0)
+    return { ok: false, blocked: true, reason: "INVALID_USD_SIZE" };
+  if (!Number.isFinite(px) || px <= 0)
+    return { ok: false, blocked: true, reason: "MISSING_LAST_PRICE" };
 
-  // Kraken volume precision varies; keep a safe precision
-  const volumeStr = vol.toFixed(8);
+  const volume = (usdNum / px).toFixed(8);
 
-  // Dry-run: never touches Kraken
   if (dryRun) {
     return {
       ok: true,
       dryRun: true,
-      request: { pair, type: dir, ordertype: 'market', volume: volumeStr },
-      note: 'Dry-run is ON. No order was sent to Kraken.',
+      request: { pair, type: dir, ordertype: "market", volume },
+      note: "Dry-run enabled. No Kraken order sent.",
     };
   }
 
-  // Live call
-  const result = await privateRequest('/0/private/AddOrder', {
+  const result = await privateRequest("/0/private/AddOrder", {
     pair,
     type: dir,
-    ordertype: 'market',
-    volume: volumeStr,
+    ordertype: "market",
+    volume,
   });
 
   return { ok: true, dryRun: false, result };
 }
 
+/* ------------------ EXPORTS ------------------ */
 module.exports = {
   privateRequest,
   getKeysSafe,

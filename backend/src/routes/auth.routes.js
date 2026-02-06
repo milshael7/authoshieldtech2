@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const router = express.Router();
 
 const { sign } = require('../auth/jwt');
+const { authRequired } = require('../middleware/auth');
 const users = require('../users/user.service');
 const { audit } = require('../lib/audit');
 
@@ -15,6 +16,11 @@ function cleanStr(v, max = 200) {
   return String(v || '').trim().slice(0, max);
 }
 
+/**
+ * --------------------
+ * LOGIN
+ * --------------------
+ */
 router.post('/login', (req, res) => {
   try {
     const email = cleanEmail(req.body?.email);
@@ -27,7 +33,6 @@ router.post('/login', (req, res) => {
     const u = users.findByEmail(email);
     if (!u) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // passwordHash is stored on raw user record (not sanitized)
     if (!u.passwordHash || !bcrypt.compareSync(password, u.passwordHash)) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -48,7 +53,7 @@ router.post('/login', (req, res) => {
 
     audit({ actorId: u.id, action: 'LOGIN', targetType: 'Session', targetId: u.id });
 
-    res.json({
+    return res.json({
       token,
       user: {
         id: u.id,
@@ -57,8 +62,6 @@ router.post('/login', (req, res) => {
         companyId: u.companyId || null,
         mustResetPassword: !!u.mustResetPassword,
         subscriptionStatus: u.subscriptionStatus,
-
-        // ✅ frontend-friendly name + supports your DB schema typo
         autoprotectEnabled: !!(u.autoprotectEnabled || u.autoprotechEnabled),
       },
     });
@@ -67,6 +70,48 @@ router.post('/login', (req, res) => {
   }
 });
 
+/**
+ * --------------------
+ * REFRESH SESSION (NEW)
+ * --------------------
+ * Re-issues a fresh token if the current one is valid.
+ * Used on page refresh / app rehydrate.
+ */
+router.post('/refresh', authRequired, (req, res) => {
+  try {
+    const u = users.findById(req.user.id);
+    if (!u) return res.status(401).json({ error: 'User not found' });
+
+    const token = sign(
+      { id: u.id, role: u.role, companyId: u.companyId || null },
+      process.env.JWT_SECRET,
+      '7d'
+    );
+
+    audit({ actorId: u.id, action: 'TOKEN_REFRESH', targetType: 'Session', targetId: u.id });
+
+    return res.json({
+      token,
+      user: {
+        id: u.id,
+        role: u.role,
+        email: u.email,
+        companyId: u.companyId || null,
+        mustResetPassword: !!u.mustResetPassword,
+        subscriptionStatus: u.subscriptionStatus,
+        autoprotectEnabled: !!(u.autoprotectEnabled || u.autoprotechEnabled),
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * --------------------
+ * RESET PASSWORD
+ * --------------------
+ */
 router.post('/reset-password', (req, res) => {
   try {
     const email = cleanEmail(req.body?.email);
@@ -76,7 +121,6 @@ router.post('/reset-password', (req, res) => {
       return res.status(400).json({ error: 'Email and newPassword required' });
     }
 
-    // basic minimum (you can raise later)
     if (newPassword.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
@@ -88,7 +132,6 @@ router.post('/reset-password', (req, res) => {
       return res.status(400).json({ error: 'Reset not required' });
     }
 
-    // actorId = user themselves here (MVP)
     users.setPassword(u.id, newPassword, u.id);
 
     audit({ actorId: u.id, action: 'PASSWORD_RESET', targetType: 'User', targetId: u.id });

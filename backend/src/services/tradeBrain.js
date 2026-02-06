@@ -4,14 +4,14 @@
 
 const aiBrain = require("./aiBrain");
 
-// ---------------- SAFETY CONSTANTS ----------------
+/* ---------------- SAFETY CONSTANTS ---------------- */
 const MIN_CONF = Number(process.env.TRADE_MIN_CONF || 0.62);
 const MIN_EDGE = Number(process.env.TRADE_MIN_EDGE || 0.0007); // 0.07%
 const MAX_TRADES_PER_DAY = Number(process.env.TRADE_MAX_TRADES_PER_DAY || 12);
 
 const ALLOWED_ACTIONS = new Set(["WAIT", "BUY", "SELL", "CLOSE"]);
 
-// ---------------- MINDSET (IMMUTABLE) ----------------
+/* ---------------- MINDSET (IMMUTABLE) ---------------- */
 const MINDSET = Object.freeze({
   winIsSuccess: true,
   loseIsFailure: true,
@@ -22,7 +22,7 @@ const MINDSET = Object.freeze({
     "Losses are failure signals: learn, tighten filters, and do not repeat.",
 });
 
-// ---------------- HELPERS ----------------
+/* ---------------- HELPERS ---------------- */
 function safeNum(x, fallback = 0) {
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
@@ -32,11 +32,7 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-// ---------------- CORE DECISION ----------------
-/**
- * makeDecision(context)
- * Returns a STRICT execution plan.
- */
+/* ---------------- CORE DECISION ---------------- */
 function makeDecision(context = {}) {
   const symbol = String(context.symbol || "BTCUSDT");
   const last = safeNum(context.last, NaN);
@@ -46,7 +42,7 @@ function makeDecision(context = {}) {
   const limits = paper.limits || {};
   const config = paper.config || {};
 
-  // Ask AI brain for its view (SAFE: optional)
+  /* -------- AI INPUT (OPTIONAL, NEVER TRUSTED BLINDLY) -------- */
   let aiView = {};
   try {
     if (typeof aiBrain.decide === "function") {
@@ -56,12 +52,12 @@ function makeDecision(context = {}) {
     aiView = {};
   }
 
-  const rawDecision = String(
+  const proposedAction = String(
     aiView.action ?? learn.decision ?? "WAIT"
   ).toUpperCase();
 
-  const baseAction = ALLOWED_ACTIONS.has(rawDecision)
-    ? rawDecision
+  const baseAction = ALLOWED_ACTIONS.has(proposedAction)
+    ? proposedAction
     : "WAIT";
 
   const confidence = safeNum(
@@ -77,28 +73,28 @@ function makeDecision(context = {}) {
   const tradesToday = safeNum(limits.tradesToday, 0);
   const lossesToday = safeNum(limits.lossesToday, 0);
 
-  let finalAction = baseAction;
+  let action = baseAction;
   let blockedReason = "";
 
-  // ---------------- HARD SAFETY GATES ----------------
+  /* ---------------- HARD SAFETY GATES ---------------- */
   if (!Number.isFinite(last)) {
-    finalAction = "WAIT";
+    action = "WAIT";
     blockedReason = "Missing last price.";
   } else if (limits.halted) {
-    finalAction = "WAIT";
+    action = "WAIT";
     blockedReason = `Halted: ${limits.haltReason || "safety stop"}`;
   } else if (tradesToday >= MAX_TRADES_PER_DAY) {
-    finalAction = "WAIT";
+    action = "WAIT";
     blockedReason = `Daily trade limit reached (${tradesToday}/${MAX_TRADES_PER_DAY}).`;
   } else if (confidence < MIN_CONF) {
-    finalAction = "WAIT";
+    action = "WAIT";
     blockedReason = `Confidence too low (${confidence.toFixed(2)} < ${MIN_CONF}).`;
   } else if (Math.abs(edge) < MIN_EDGE) {
-    finalAction = "WAIT";
+    action = "WAIT";
     blockedReason = `Edge too small (${edge.toFixed(6)} < ${MIN_EDGE}).`;
   }
 
-  // ---------------- RISK MODEL ----------------
+  /* ---------------- RISK MODEL ---------------- */
   const baselinePct = clamp(
     safeNum(config.baselinePct, 0.01),
     0.001,
@@ -128,12 +124,12 @@ function makeDecision(context = {}) {
     0.05
   );
 
-  // ---------------- FINAL PLAN ----------------
+  /* ---------------- FINAL PLAN ---------------- */
   return {
     symbol,
-    action: finalAction,
-    confidence,
-    edge,
+    action,
+    confidence: action === "WAIT" ? 0 : confidence,
+    edge: action === "WAIT" ? 0 : edge,
     riskPct,
     slPct,
     tpPct,
@@ -143,7 +139,7 @@ function makeDecision(context = {}) {
   };
 }
 
-// ---------------- EXPLAIN (UI / LOGS) ----------------
+/* ---------------- EXPLAIN ---------------- */
 function explain(message, context) {
   try {
     if (typeof aiBrain.answer === "function") {

@@ -1,6 +1,6 @@
 // backend/src/services/paperTrader.js
-// Paper Trading Engine + AI Narration Hooks (Step 10)
-// SAFE • Deterministic • Human-explainable
+// Paper Trading Engine + AI Narration Hooks (FIXED STEP 10)
+// SAFE • Deterministic • Human-explainable • Drop-in Replacement
 
 const fs = require("fs");
 const path = require("path");
@@ -32,10 +32,10 @@ function dayKey(ts) {
 }
 
 function narrate(text, meta = {}) {
-  // 🔊 This is the AI narration bridge
+  if (!text) return;
   addMemory({
     type: "trade_event",
-    text,
+    text: String(text).slice(0, 800),
     meta,
   });
 }
@@ -51,6 +51,7 @@ function defaultState() {
     peakEquity: START_BAL,
 
     realized: { wins: 0, losses: 0, net: 0 },
+    costs: { fees: 0, slippage: 0, spread: 0 },
 
     position: null,
     lastPriceBySymbol: {},
@@ -95,7 +96,7 @@ function save() {
 
 load();
 
-/* ================= CORE LOGIC ================= */
+/* ================= CORE ================= */
 
 function resetDayIfNeeded(ts) {
   const dk = dayKey(ts);
@@ -113,21 +114,22 @@ function updateEquity(price) {
   } else {
     state.equity = state.cashBalance;
   }
-
   state.peakEquity = Math.max(state.peakEquity, state.equity);
 }
 
 function checkDrawdown() {
+  if (state.limits.halted) return;
+
   const dd = (state.peakEquity - state.equity) / state.peakEquity;
   if (dd >= MAX_DRAWDOWN_PCT) {
     state.limits.halted = true;
     state.limits.haltReason = "max_drawdown";
 
     narrate(
-      `Trading halted due to drawdown. Equity fell more than ${(MAX_DRAWDOWN_PCT * 100).toFixed(
+      `Trading halted. Drawdown exceeded ${(MAX_DRAWDOWN_PCT * 100).toFixed(
         0
-      )} percent from peak.`,
-      { reason: "drawdown" }
+      )}% from peak equity.`,
+      { reason: "drawdown", equity: state.equity }
     );
   }
 }
@@ -146,11 +148,17 @@ function openPosition(symbol, price, riskPct) {
   if (usd <= 0) return;
 
   const spread = price * (SPREAD_BP / 10000);
-  const slip = price * (SLIPPAGE_BP / 10000);
-  const fill = price + spread + slip;
-  const qty = usd / fill;
+  const slippage = price * (SLIPPAGE_BP / 10000);
+  const fill = price + spread + slippage;
 
-  state.cashBalance -= usd;
+  const qty = usd / fill;
+  const fee = usd * FEE_RATE;
+
+  state.cashBalance -= usd + fee;
+  state.costs.fees += fee;
+  state.costs.spread += spread * qty;
+  state.costs.slippage += slippage * qty;
+
   state.position = { symbol, entry: fill, qty, ts: Date.now() };
   state.limits.tradesToday++;
   state.limits.lastTradeTs = Date.now();
@@ -158,8 +166,8 @@ function openPosition(symbol, price, riskPct) {
   narrate(
     `Entered ${symbol} at ${fill.toFixed(
       2
-    )}. Risked ${riskPct * 100}% of balance.`,
-    { symbol, action: "BUY" }
+    )}. Risked ${(riskPct * 100).toFixed(1)}% of balance.`,
+    { symbol, action: "BUY", entry: fill }
   );
 }
 
@@ -167,8 +175,12 @@ function closePosition(price, reason) {
   const pos = state.position;
   if (!pos) return;
 
-  const pnl = (price - pos.entry) * pos.qty;
-  state.cashBalance += pos.qty * price;
+  const gross = (price - pos.entry) * pos.qty;
+  const fee = Math.abs(gross) * FEE_RATE;
+  const pnl = gross - fee;
+
+  state.cashBalance += pos.qty * price - fee;
+  state.costs.fees += fee;
   state.realized.net += pnl;
 
   if (pnl > 0) state.realized.wins++;
@@ -177,8 +189,8 @@ function closePosition(price, reason) {
   narrate(
     `Closed ${pos.symbol} at ${price.toFixed(
       2
-    )}. Result: ${pnl >= 0 ? "profit" : "loss"} of ${pnl.toFixed(2)}.`,
-    { symbol: pos.symbol, action: "CLOSE", pnl }
+    )}. ${pnl >= 0 ? "Profit" : "Loss"}: ${pnl.toFixed(2)}.`,
+    { symbol: pos.symbol, action: "CLOSE", pnl, reason }
   );
 
   state.position = null;
@@ -196,7 +208,10 @@ function tick(symbol, price, ts = Date.now()) {
   updateEquity(price);
   checkDrawdown();
 
-  if (state.learnStats.ticksSeen < WARMUP_TICKS) return;
+  if (state.learnStats.ticksSeen < WARMUP_TICKS) {
+    save();
+    return;
+  }
 
   const plan = makeDecision({
     symbol,
@@ -208,7 +223,10 @@ function tick(symbol, price, ts = Date.now()) {
   state.learnStats.confidence = plan.confidence;
   state.learnStats.lastReason = plan.blockedReason || plan.action;
 
-  if (!canTrade(ts)) return;
+  if (!canTrade(ts)) {
+    save();
+    return;
+  }
 
   if (plan.action === "BUY" && !state.position) {
     openPosition(symbol, price, plan.riskPct);

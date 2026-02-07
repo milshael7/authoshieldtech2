@@ -1,19 +1,14 @@
 // backend/src/routes/ai.routes.js
-// AutoShield AI Routes — Voice + Memory + Personality
-// FULL DROP-IN FILE (Step 9)
-// - Uses lib/brain personality + memory
-// - Non-robotic responses
-// - Real-time trading explanations
-// - Backward compatible: { ok, reply, speakText }
+// AutoShield AI Routes — Voice + Memory (STABLE DROP-IN)
+// ✔ Matches current lib/brain.js exports
+// ✔ Non-robotic local intelligence
+// ✔ OpenAI optional
+// ✔ Returns { ok, reply, speakText }
 
 const express = require("express");
 const router = express.Router();
 
-const {
-  addMemory,
-  listMemory,
-  buildPersonality,
-} = require("../lib/brain");
+const { addMemory, listMemory } = require("../lib/brain");
 
 /* ================= HELPERS ================= */
 
@@ -47,7 +42,6 @@ function summarizeTradingContext(context) {
     tradeStyle: cleanStr(context?.trade_style, 20) || "—",
 
     risk: context?.risk || {},
-
     stats: context?.stats || {},
 
     paper: {
@@ -59,31 +53,33 @@ function summarizeTradingContext(context) {
       losses: Number(p.realized?.losses ?? 0),
       decision: cleanStr(p.learnStats?.decision || p.decision, 40) || "WAIT",
       confidence: Number(p.learnStats?.confidence ?? p.confidence ?? 0),
-      reason: cleanStr(p.learnStats?.lastReason || p.decisionReason, 300) || "—",
+      reason: cleanStr(
+        p.learnStats?.lastReason || p.decisionReason,
+        300
+      ) || "—",
       position: p.position || null,
     },
   };
 }
 
-/* ================= LOCAL INTELLIGENCE (NO OPENAI) ================= */
+/* ================= LOCAL INTELLIGENCE ================= */
 
 function localReply(message, context) {
   const snap = summarizeTradingContext(context);
   const low = message.toLowerCase();
 
-  // Status / Explain
   if (
     low.includes("explain") ||
     low.includes("status") ||
-    low.includes("what") ||
-    low.includes("summary")
+    low.includes("summary") ||
+    low.includes("what")
   ) {
     const lines = [
       `Here’s what’s happening right now.`,
       `Mode: ${snap.mode} • Style: ${snap.tradeStyle}`,
       `P&L: $${snap.paper.pnl.toFixed(2)} (Unrealized $${snap.paper.unrealized.toFixed(2)})`,
       `Wins / Losses: ${snap.paper.wins} / ${snap.paper.losses}`,
-      `Current decision: ${snap.paper.decision} (${Math.round(
+      `Decision: ${snap.paper.decision} (${Math.round(
         snap.paper.confidence * 100
       )}% confidence)`,
       `Reason: ${snap.paper.reason}`,
@@ -100,27 +96,26 @@ function localReply(message, context) {
     return {
       reply: lines.join("\n"),
       speakText: lines.join(". "),
-      meta: { kind: "local_dashboard" },
+      meta: { kind: "dashboard" },
     };
   }
 
-  // Why trade?
   if (low.includes("why")) {
     return {
-      reply: `Here’s why.\nDecision: ${snap.paper.decision}\nConfidence: ${Math.round(
+      reply: `Decision: ${snap.paper.decision}\nConfidence: ${Math.round(
         snap.paper.confidence * 100
       )}%\nReason: ${snap.paper.reason}`,
       speakText: `Here’s why. ${snap.paper.reason}`,
-      meta: { kind: "local_reason" },
+      meta: { kind: "reason" },
     };
   }
 
   return {
     reply:
-      "You can ask me what’s happening, why a trade happened, or what I’m waiting for.",
+      "You can ask what’s happening, why a trade happened, or what I’m waiting for.",
     speakText:
-      "You can ask me what’s happening, why a trade happened, or what I’m waiting for.",
-    meta: { kind: "local_help" },
+      "You can ask what’s happening, why a trade happened, or what I’m waiting for.",
+    meta: { kind: "help" },
   };
 }
 
@@ -134,34 +129,17 @@ async function openaiReply(message, context) {
     cleanStr(process.env.OPENAI_CHAT_MODEL, 60) || "gpt-4o-mini";
 
   const snap = summarizeTradingContext(context);
-  const personality = buildPersonality();
-  const memory = listMemory({ limit: 30 });
+  const memory = listMemory({ limit: 25 });
 
   const system = `
-You are ${personality.identity}, the AI voice of a live trading platform.
-
-Tone:
-${personality.tone}
-
-Rules:
-- Speak naturally, like a human operator.
-- Explain trades ONLY using the provided snapshot.
-- Never hallucinate missing data.
-- Keep responses clear, confident, and calm.
-- Provide a spoken version (speakText) that sounds natural aloud.
-
-Known platform facts:
-${personality.platformFacts.join("\n")}
-
-Preferences:
-${personality.preferences.join("\n")}
-
-Hard rules:
-${personality.rules.join("\n")}
+You are AutoShield, a calm, professional trading assistant.
+Speak naturally. Never hallucinate.
+Explain trades ONLY from the snapshot provided.
+Provide a speakText version that sounds natural aloud.
 `;
 
   const user = `
-User said:
+User message:
 ${message}
 
 Live snapshot:
@@ -170,7 +148,7 @@ ${JSON.stringify(snap, null, 2)}
 Recent memory:
 ${memory.map((m) => `- (${m.type}) ${m.text}`).join("\n")}
 
-Respond ONLY with JSON:
+Respond ONLY as JSON:
 {
   "reply": "...",
   "speakText": "..."
@@ -194,7 +172,7 @@ Respond ONLY with JSON:
     }),
   });
 
-  if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
+  if (!r.ok) return null;
 
   const data = await r.json();
   const raw = data?.choices?.[0]?.message?.content || "{}";
@@ -221,17 +199,14 @@ router.post("/chat", async (req, res) => {
 
     let out = null;
 
-    // Try OpenAI first (if configured)
     try {
       out = await openaiReply(message, context);
     } catch {
       out = null;
     }
 
-    // Fallback to local intelligence
     if (!out) out = localReply(message, context);
 
-    // Light learning
     const low = message.toLowerCase();
     if (
       low.includes("remember") ||
@@ -243,15 +218,12 @@ router.post("/chat", async (req, res) => {
 
     return res.json({ ok: true, ...out });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || "AI error" });
+    return res.status(500).json({ ok: false, error: "AI error" });
   }
 });
 
-/* ================= MEMORY ADMIN ================= */
+/* ================= MEMORY ================= */
 
-// GET /api/ai/memory
 router.get("/memory", (req, res) => {
   if (!hasOwnerAccess(req)) {
     return res.status(403).json({ ok: false, error: "Forbidden" });
@@ -266,7 +238,6 @@ router.get("/memory", (req, res) => {
   });
 });
 
-// POST /api/ai/learn
 router.post("/learn", (req, res) => {
   if (!hasOwnerAccess(req)) {
     return res.status(403).json({ ok: false, error: "Forbidden" });
@@ -285,7 +256,6 @@ router.post("/learn", (req, res) => {
   return res.json({ ok: true, saved: rec });
 });
 
-// GET /api/ai/brain/status
 router.get("/brain/status", (req, res) => {
   return res.json({
     ok: true,

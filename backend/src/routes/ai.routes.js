@@ -1,9 +1,6 @@
 // backend/src/routes/ai.routes.js
-// Smarter AI routes (non-robotic) + real paperTrader awareness
-// ✅ Full live trading context
-// ✅ Voice-ready responses (speakText)
-// ✅ Memory support
-// ✅ OpenAI optional (safe fallback)
+// AutoShield AI — Personality Locked + Voice-First Responses
+// Step 2: Brand voice, mindset, cadence control
 
 const express = require("express");
 const router = express.Router();
@@ -11,13 +8,48 @@ const router = express.Router();
 const { addMemory, listMemory } = require("../lib/brain");
 const paperTrader = require("../services/paperTrader");
 
-// Optional existing service (if you already have it)
-let aiBrain = null;
-try {
-  aiBrain = require("../services/aiBrain");
-} catch {
-  aiBrain = null;
-}
+/* ================= BRAND PERSONA ================= */
+
+/**
+ * This is the HEART of AutoShield.
+ * Change this = change how the AI thinks & speaks.
+ */
+const AUTOSHIELD_PERSONA = `
+You are AutoShield.
+
+Identity:
+- You are a calm, confident trading operator.
+- You speak like a professional human trader, not an assistant.
+- You explain what you see. You do NOT hype. You do NOT guess.
+- You never talk like a robot.
+
+Behavior rules:
+- If data is missing, say it’s missing.
+- If nothing is happening, say you’re waiting and why.
+- When explaining trades, always answer:
+  1. What happened
+  2. Why it happened
+  3. Risk involved
+  4. What you are watching next
+
+Voice rules:
+- Short sentences.
+- Natural pauses.
+- No emojis.
+- No code blocks.
+- Speak like you’re on a trading desk.
+
+Authority:
+- You are allowed to say “I don’t like this setup.”
+- You are allowed to say “I’m waiting.”
+- You are allowed to say “Risk is elevated.”
+
+You are NOT customer support.
+You are NOT motivational.
+You are NOT chatty.
+
+You are AutoShield.
+`;
 
 /* ================= HELPERS ================= */
 
@@ -25,213 +57,147 @@ function cleanStr(v, max = 8000) {
   return String(v || "").trim().slice(0, max);
 }
 
-function clampInt(n, min, max, fallback) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(x)));
-}
+/* ================= CONTEXT ================= */
 
-function hasOwnerAccess(req) {
-  const key = cleanStr(process.env.AI_OWNER_KEY, 200);
-  if (!key) return true;
-  const sent = cleanStr(req.headers["x-owner-key"], 200);
-  return !!sent && sent === key;
-}
-
-/* ================= CONTEXT NORMALIZATION ================= */
-
-function summarizeTradingContext(context) {
-  const p = context?.paper || {};
-  const symbol = cleanStr(context?.symbol, 20) || "—";
-  const mode = cleanStr(context?.trading_mode || context?.mode, 20) || "—";
-  const last = Number(context?.last);
+function buildSnapshot(clientContext) {
+  let paper = null;
+  try {
+    paper = paperTrader.snapshot();
+  } catch {}
 
   return {
-    symbol,
-    mode,
-    last: Number.isFinite(last) ? last : null,
-
-    running: !!p.running,
-    equity: Number(p.equity ?? 0),
-    cash: Number(p.cashBalance ?? 0),
-    unrealized: Number(p.unrealizedPnL ?? 0),
-
-    wins: Number(p.realized?.wins ?? 0),
-    losses: Number(p.realized?.losses ?? 0),
-    net: Number(p.realized?.net ?? 0),
-
-    decision: cleanStr(p.decision, 40) || "WAIT",
-    confidence: Number(p.confidence ?? 0),
-    decisionReason: cleanStr(p.decisionReason, 300) || "—",
-
-    position: p.position
-      ? {
-          symbol: cleanStr(p.position.symbol, 20),
-          entry: Number(p.position.entry),
-          qty: Number(p.position.qty),
-          ageMs: Date.now() - Number(p.position.ts),
-        }
-      : null,
+    platform: "AutoShield",
+    room: "TradingRoom",
+    ...clientContext,
+    paper,
+    serverTime: new Date().toISOString(),
   };
 }
 
-/* ================= LOCAL SMART REPLY ================= */
+/* ================= LOCAL VOICE-FIRST REPLY ================= */
 
 function localReply(message, context) {
   const m = cleanStr(message, 2000).toLowerCase();
-  const snap = summarizeTradingContext(context);
+  const p = context.paper || {};
+
+  const decision = p.decision || "WAIT";
+  const confidence = Math.round((p.confidence || 0) * 100);
+  const reason = p.lastReason || "No clear edge yet.";
 
   if (
-    m.includes("explain") ||
     m.includes("status") ||
-    m.includes("what's going on") ||
-    m.includes("summary")
+    m.includes("explain") ||
+    m.includes("what's going on")
   ) {
-    const text = `
-Here’s what’s happening right now.
+    const reply = `
+Here’s where we are.
 
-Mode: ${snap.mode}
-Decision: ${snap.decision} (${Math.round(snap.confidence * 100)}% confidence)
+Decision: ${decision}.
+Confidence: ${confidence} percent.
 
-Equity: $${snap.equity.toFixed(2)}
-Unrealized P&L: $${snap.unrealized.toFixed(2)}
-Wins / Losses: ${snap.wins} / ${snap.losses}
+Equity: ${p.equity?.toFixed?.(2) || "—"}.
+Unrealized P&L: ${p.unrealizedPnL?.toFixed?.(2) || "—"}.
 
-${
-  snap.position
-    ? `Open position in ${snap.position.symbol} at $${snap.position.entry}`
-    : "No open position right now."
-}
+${p.position ? `Position open in ${p.position.symbol}.` : "No position open."}
 
-Reason: ${snap.decisionReason}
-`.trim();
+Reason: ${reason}.
+`;
 
     return {
-      reply: text,
-      speakText: text.replace(/\n+/g, ". "),
-      meta: { kind: "dashboard_status", snap },
+      reply: reply.trim(),
+      speakText: reply.replace(/\n+/g, ". ").trim(),
     };
   }
 
-  if (m.includes("why") && (m.includes("buy") || m.includes("sell") || m.includes("trade"))) {
-    const text = `
-Decision: ${snap.decision}
-Confidence: ${Math.round(snap.confidence * 100)}%
+  if (m.includes("why") && (m.includes("buy") || m.includes("sell"))) {
+    const reply = `
+That trade was taken for one reason.
 
-Reason:
-${snap.decisionReason}
-`.trim();
+${reason}
+
+Confidence was ${confidence} percent.
+Risk was controlled.
+`;
 
     return {
-      reply: text,
-      speakText: text.replace(/\n+/g, ". "),
-      meta: { kind: "trade_reason", snap },
+      reply: reply.trim(),
+      speakText: reply.replace(/\n+/g, ". ").trim(),
     };
   }
 
   return {
     reply:
-      "I’m live and connected to your trading engine. You can ask me why a trade happened, why I’m waiting, or what I’m watching next.",
+      "I’m live. Ask me what I’m seeing, why I’m waiting, or what risk looks like.",
     speakText:
-      "I’m live and connected to your trading engine. Ask me why a trade happened, or what I’m waiting for.",
-    meta: { kind: "help" },
+      "I’m live. Ask me what I’m seeing, why I’m waiting, or what risk looks like.",
   };
 }
 
-/* ================= OPENAI (OPTIONAL) ================= */
+/* ================= OPENAI (OPTIONAL, PERSONA LOCKED) ================= */
 
 async function openaiReply(message, context, memoryItems) {
-  const apiKey = cleanStr(process.env.OPENAI_API_KEY, 200);
-  if (!apiKey) return null;
+  if (!process.env.OPENAI_API_KEY) return null;
 
-  const snap = summarizeTradingContext(context);
+  const payload = {
+    model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+    temperature: 0.35,
+    messages: [
+      { role: "system", content: AUTOSHIELD_PERSONA },
+      {
+        role: "user",
+        content: `
+User said:
+${message}
 
-  const system = `
-You are AutoShield, a calm, confident trading assistant.
-You speak naturally, like a human operator.
-You NEVER invent trades.
-You ONLY explain what is in the snapshot.
-If something is unknown, you say so.
-Return JSON only.
-`;
+Live trading snapshot (truth only):
+${JSON.stringify(context.paper, null, 2)}
 
-  const user = `
-User said: ${message}
-
-Trading snapshot:
-${JSON.stringify(snap, null, 2)}
-
-Return:
+Respond in JSON:
 {
   "reply": "screen text",
-  "speakText": "spoken version"
+  "speakText": "spoken version, slightly smoother"
 }
-`;
+`,
+      },
+    ],
+    response_format: { type: "json_object" },
+  };
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: system.trim() },
-        { role: "user", content: user.trim() },
-      ],
-      response_format: { type: "json_object" },
-    }),
+    body: JSON.stringify(payload),
   });
 
-  if (!r.ok) return null;
+  if (!res.ok) return null;
 
-  const data = await r.json();
+  const data = await res.json();
   const content = data?.choices?.[0]?.message?.content;
-  if (!content) return null;
 
   try {
-    const parsed = JSON.parse(content);
-    return {
-      reply: cleanStr(parsed.reply, 12000),
-      speakText: cleanStr(parsed.speakText || parsed.reply, 12000),
-      meta: { kind: "openai" },
-    };
+    return JSON.parse(content);
   } catch {
     return null;
   }
 }
 
-/* ================= ROUTES ================= */
+/* ================= ROUTE ================= */
 
 router.post("/chat", async (req, res) => {
   try {
     const message = cleanStr(req.body?.message, 8000);
-    if (!message) return res.status(400).json({ ok: false, error: "Missing message" });
-
-    const clientContext = req.body?.context || {};
-
-    let paperSnapshot = null;
-    try {
-      paperSnapshot = paperTrader.snapshot();
-    } catch {}
-
-    const context = {
-      ...clientContext,
-      paper: paperSnapshot,
-    };
-
-    const memoryItems = listMemory({ limit: 25 });
-
-    if (aiBrain?.answer) {
-      const out = await aiBrain.answer(message, context);
-      if (out?.reply) {
-        return res.json({ ok: true, reply: out.reply, speakText: out.speakText || out.reply });
-      }
+    if (!message) {
+      return res.status(400).json({ ok: false, error: "Missing message" });
     }
 
+    const context = buildSnapshot(req.body?.context || {});
+    const memoryItems = listMemory({ limit: 20 });
+
     let out = null;
+
     try {
       out = await openaiReply(message, context, memoryItems);
     } catch {}
@@ -246,17 +212,6 @@ router.post("/chat", async (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
-});
-
-/* ================= MEMORY ================= */
-
-router.get("/memory", (req, res) => {
-  if (!hasOwnerAccess(req)) {
-    return res.status(403).json({ ok: false, error: "Forbidden" });
-  }
-  const limit = clampInt(req.query.limit, 1, 500, 50);
-  const type = cleanStr(req.query.type, 40) || null;
-  return res.json({ ok: true, items: listMemory({ limit, type }) });
 });
 
 module.exports = router;

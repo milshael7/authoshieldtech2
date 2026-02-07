@@ -1,153 +1,121 @@
 // backend/src/routes/paper.routes.js
-// Paper endpoints: status + reset + config (owner controls)
-// ✅ reset can be protected with PAPER_RESET_KEY (x-reset-key)
-// ✅ config can be protected with PAPER_OWNER_KEY (x-owner-key)
-// ✅ returns "config" so frontend Trading Controls can load/save without breaking
+// Paper endpoints: status + reset + config (SAFE + ENGINE-ALIGNED)
+// ✔ FULL DROP-IN REPLACEMENT
+// ✔ Matches current paperTrader implementation (Step 10)
+// ✔ No phantom methods, no crashes
+// ✔ Frontend-safe response shapes
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-const paperTrader = require('../services/paperTrader');
+const paperTrader = require("../services/paperTrader");
 
-// ------------------ simple key gates ------------------
-// If you DON'T set a key, that action is OPEN (not recommended).
+/* ================= KEY GATES ================= */
+// If a key is NOT set, the action is OPEN (not recommended).
 
 function resetAllowed(req) {
-  const key = String(process.env.PAPER_RESET_KEY || '').trim();
+  const key = String(process.env.PAPER_RESET_KEY || "").trim();
   if (!key) return true;
-  const sent = String(req.headers['x-reset-key'] || '').trim();
+  const sent = String(req.headers["x-reset-key"] || "").trim();
   return !!sent && sent === key;
 }
 
-function ownerAllowed(req) {
-  const key = String(process.env.PAPER_OWNER_KEY || '').trim();
-  if (!key) return true;
-  const sent = String(req.headers['x-owner-key'] || '').trim();
-  return !!sent && sent === key;
-}
-
-// Coerce + clamp inputs safely
-function toNum(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-function toInt(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.floor(n) : fallback;
-}
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-// ------------------ routes ------------------
+/* ================= ROUTES ================= */
 
 // GET /api/paper/status
-router.get('/status', (req, res) => {
+router.get("/status", (req, res) => {
   try {
-    return res.json(paperTrader.snapshot());
+    return res.json({
+      ok: true,
+      snapshot: paperTrader.snapshot(),
+      time: new Date().toISOString(),
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
 // POST /api/paper/reset
-router.post('/reset', (req, res) => {
+router.post("/reset", (req, res) => {
   try {
     if (!resetAllowed(req)) {
       return res.status(403).json({
         ok: false,
-        error: 'Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY on backend).'
+        error:
+          "Reset blocked. Missing/invalid x-reset-key (set PAPER_RESET_KEY).",
       });
     }
 
     paperTrader.hardReset();
+
     return res.json({
       ok: true,
-      message: 'Paper wallet reset complete.',
-      stateFile: process.env.PAPER_STATE_PATH || '(default from paperTrader)',
-      snapshot: paperTrader.snapshot()
+      message: "Paper trader reset complete.",
+      snapshot: paperTrader.snapshot(),
+      time: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
-// ✅ GET /api/paper/config
-// Frontend expects either:
-//   { config: {...} }  OR the config object itself.
-// We'll return BOTH for compatibility + keep your old keys too.
-router.get('/config', (req, res) => {
+/* ================= CONFIG (READ-ONLY) ================= */
+/*
+  IMPORTANT:
+  The current paperTrader engine (Step 10) does NOT support
+  runtime config mutation. All values are ENV-driven.
+
+  This endpoint exists so the frontend can READ limits
+  without breaking, not to modify them.
+*/
+
+// GET /api/paper/config
+router.get("/config", (req, res) => {
   try {
     const snap = paperTrader.snapshot();
 
-    // paperTrader may store owner knobs in different places, so normalize
-    const cfg =
-      snap.config ||
-      snap.owner ||
-      snap.paperConfig ||
-      {
-        baselinePct: 0.02,
-        maxPct: 0.05,
-        maxTradesPerDay: 12
-      };
+    const config = {
+      startBalance: Number(process.env.PAPER_START_BALANCE || 100000),
+      warmupTicks: Number(process.env.PAPER_WARMUP_TICKS || 250),
+
+      feeRate: Number(process.env.PAPER_FEE_RATE || 0.0026),
+      slippageBp: Number(process.env.PAPER_SLIPPAGE_BP || 8),
+      spreadBp: Number(process.env.PAPER_SPREAD_BP || 6),
+
+      cooldownMs: Number(process.env.PAPER_COOLDOWN_MS || 12000),
+      maxTradesPerDay: Number(process.env.PAPER_MAX_TRADES_PER_DAY || 40),
+      maxDrawdownPct: Number(process.env.PAPER_MAX_DRAWDOWN_PCT || 0.25),
+    };
 
     return res.json({
       ok: true,
-      config: cfg,            // ✅ what frontend reads
-      owner: cfg,             // ✅ backward compatible with your earlier response shape
-      sizing: snap.sizing || {},
+      config,          // ✅ frontend-friendly
+      owner: config,   // ✅ backward compatible
       limits: snap.limits || {},
-      time: new Date().toISOString()
+      time: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+    });
   }
 });
 
-// ✅ POST /api/paper/config
-// Owner sets baselinePct/maxPct/maxTradesPerDay
-router.post('/config', (req, res) => {
-  try {
-    if (!ownerAllowed(req)) {
-      return res.status(403).json({
-        ok: false,
-        error: 'Config blocked. Missing/invalid x-owner-key (set PAPER_OWNER_KEY on backend).'
-      });
-    }
-
-    const body = req.body || {};
-
-    // sanitize + clamp
-    const patch = {};
-
-    if (body.baselinePct != null) patch.baselinePct = clamp(toNum(body.baselinePct, 0.02), 0, 1);
-    if (body.maxPct != null) patch.maxPct = clamp(toNum(body.maxPct, 0.05), 0, 1);
-    if (body.maxTradesPerDay != null) patch.maxTradesPerDay = clamp(toInt(body.maxTradesPerDay, 12), 1, 1000);
-
-    if (
-      patch.baselinePct != null &&
-      patch.maxPct != null &&
-      patch.maxPct < patch.baselinePct
-    ) {
-      return res.status(400).json({ ok: false, error: 'maxPct must be >= baselinePct' });
-    }
-
-    // Apply + return normalized result
-    const cfg = paperTrader.setConfig(patch);
-    const snap = paperTrader.snapshot();
-
-    return res.json({
-      ok: true,
-      message: 'Paper config updated.',
-      config: cfg,            // ✅ frontend-friendly
-      owner: cfg,             // ✅ backward compatible
-      sizing: snap.sizing || {},
-      limits: snap.limits || {},
-      time: new Date().toISOString()
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+// POST /api/paper/config
+// ❌ Disabled intentionally (engine does not support it yet)
+router.post("/config", (req, res) => {
+  return res.status(409).json({
+    ok: false,
+    error:
+      "Runtime config updates are not supported. Set PAPER_* env variables and restart the server.",
+  });
 });
 
 module.exports = router;

@@ -1,4 +1,3 @@
-// backend/src/server.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -10,6 +9,8 @@ const { WebSocketServer } = require("ws");
 
 const { ensureDb } = require("./lib/db");
 const users = require("./users/user.service");
+
+const tenantMiddleware = require("./middleware/tenant"); // ✅ ADD THIS
 
 const paperTrader = require("./services/paperTrader");
 const liveTrader = require("./services/liveTrader");
@@ -70,8 +71,14 @@ app.get("/health", (req, res) =>
   })
 );
 
-// ---------------- ROUTES ----------------
+// ---------------- AUTH (NO TENANT YET) ----------------
 app.use("/api/auth", authLimiter, require("./routes/auth.routes"));
+
+// 🔒 TENANT CONTEXT STARTS HERE
+// Everything below this line REQUIRES a company context
+app.use(tenantMiddleware);
+
+// ---------------- TENANT-SCOPED ROUTES ----------------
 app.use("/api/admin", require("./routes/admin.routes"));
 app.use("/api/manager", require("./routes/manager.routes"));
 app.use("/api/company", require("./routes/company.routes"));
